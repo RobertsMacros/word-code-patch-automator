@@ -8,6 +8,9 @@ venv/
 # Results (generated each run)
 results/
 
+# Code export dump
+project_code_export.txt
+
 # Word temp files
 ~$*.doc*
 *.tmp
