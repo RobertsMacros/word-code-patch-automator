@@ -1,0 +1,2053 @@
+==============================================================================
+  PROJECT CODE EXPORT — word-code-patch-automator
+  Generated: 2026-03-13 09:04:35
+  Files: 13
+==============================================================================
+
+TABLE OF CONTENTS
+----------------------------------------
+   1. project.json
+   2. CLAUDE.md
+   3. .gitattributes
+   4. .gitignore
+   5. requirements.txt
+   6. controller/controller.py
+   7. controller/word_runner.py
+   8. controller/vba_io.py
+   9. controller/__init__.py
+  10. controller/templates/repair_prompt.md
+  11. harness/TestHarness.bas
+  12. harness/Test_Smoke.bas
+  13. README.md
+
+
+==============================================================================
+  FILE 1: project.json
+==============================================================================
+
+{
+    "project_name": "MyVBAProject",
+
+    "host_doc": "host/MacroHost.docm",
+    "src_dir": "src",
+    "harness_dir": "harness",
+    "fixtures_dir": "tests/fixtures",
+    "expected_dir": "tests/expected",
+    "results_dir": "results",
+
+    "mutable_paths": [
+        "src/",
+        "controller/",
+        "harness/"
+    ],
+    "locked_paths": [
+        "tests/fixtures/",
+        "tests/expected/",
+        "project.json",
+        "CLAUDE.md"
+    ],
+
+    "controller": {
+        "max_iterations": 5,
+        "timeout_seconds": 60,
+        "word_visible": false,
+        "kill_on_timeout": true
+    },
+
+    "harness": {
+        "entry_sub": "RunAllTests"
+    }
+}
+
+==============================================================================
+  FILE 2: CLAUDE.md
+==============================================================================
+
+# CLAUDE.md — Instructions for Claude Code
+
+## Project
+Word VBA Patch Automator — a local automation loop for testing and repairing VBA macro code.
+
+## Protected Paths (DO NOT MODIFY)
+The following paths are protected. You must NEVER create, edit, delete, or overwrite files in these locations:
+
+- `tests/fixtures/` — fixture documents used as test inputs
+- `tests/expected/` — expected outputs for regression tests
+- `project.json` — project configuration
+- `CLAUDE.md` — this file
+
+## Mutable Paths (YOU MAY MODIFY)
+You may modify files under:
+
+- `src/` — VBA source modules (.bas, .cls, .frm)
+- `controller/` — Python controller and runner scripts
+- `harness/` — VBA test harness modules
+
+## Repair Task Rules
+When given a repair prompt:
+1. Read the failing test details carefully
+2. Read the relevant source files
+3. Make minimal, targeted fixes to address the failures
+4. Do NOT refactor, rename, or reorganise code beyond what is needed
+5. Do NOT add new files outside the mutable paths
+6. Do NOT modify fixture documents or expected outputs
+
+==============================================================================
+  FILE 3: .gitattributes
+==============================================================================
+
+# Ensure consistent line endings
+* text=auto eol=lf
+
+# Python source
+*.py text eol=lf
+
+# VBA source
+*.bas text eol=lf
+*.cls text eol=lf
+*.frm text eol=lf
+
+# JSON / config
+*.json text eol=lf
+
+# Markdown / docs
+*.md text eol=lf
+
+# Binary companions for UserForms — do not touch
+*.frx binary
+
+==============================================================================
+  FILE 4: .gitignore
+==============================================================================
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Results (generated each run)
+results/
+
+# Code export dump is intentionally tracked — updated on every patch
+
+# Word temp files
+~$*.doc*
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+==============================================================================
+  FILE 5: requirements.txt
+==============================================================================
+
+pywin32>=306
+
+==============================================================================
+  FILE 6: controller/controller.py
+==============================================================================
+
+"""
+Word VBA Patch Automator — Controller (MVP)
+
+Runs inside Windows (e.g. Parallels VM).
+Orchestrates: import VBA → run test harness → capture results → generate repair prompt.
+
+Architecture:
+  - Controller (this script) is the parent process / orchestrator.
+  - word_runner.py is spawned as a child process for each test run.
+  - The subprocess boundary allows real timeout enforcement:
+    if Word hangs, the controller kills the child process and Word.
+
+Dependencies: pywin32 (pip install pywin32)
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+WORD_RUNNER = SCRIPT_DIR / "word_runner.py"
+
+
+def load_config():
+    with open(PROJECT_ROOT / "project.json", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Locked-path enforcement
+# ---------------------------------------------------------------------------
+
+def is_under_locked_path(rel_path, locked_paths):
+    """Check if a relative path falls under any locked path."""
+    rel_norm = rel_path.replace("\\", "/")
+    for locked in locked_paths:
+        locked_norm = locked.rstrip("/").replace("\\", "/")
+        if rel_norm == locked_norm or rel_norm.startswith(locked_norm + "/"):
+            return True
+    return False
+
+
+def check_locked_paths_working_tree(locked_paths):
+    """
+    Check for locked-path violations in the working tree.
+    Catches: modified (unstaged), staged, and untracked files under locked paths.
+    Returns list of (filepath, status) tuples for violations.
+    """
+    violations = []
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=str(PROJECT_ROOT)
+        )
+        if result.returncode != 0:
+            return violations
+
+        for line in result.stdout.splitlines():
+            if len(line) < 4:
+                continue
+
+            status_code = line[:2]
+            file_path = line[3:].strip()
+
+            # Handle renames: "R  old -> new"
+            if " -> " in file_path:
+                file_path = file_path.split(" -> ", 1)[1]
+
+            file_path = file_path.strip('"')
+
+            if is_under_locked_path(file_path, locked_paths):
+                if status_code[0] == "?" and status_code[1] == "?":
+                    status = "untracked"
+                elif status_code[0] != " ":
+                    status = "staged"
+                else:
+                    status = "modified"
+                violations.append((file_path, status))
+
+    except Exception:
+        pass
+
+    return violations
+
+
+def check_locked_paths(config):
+    """
+    Full locked-path check. Returns True if clean, False if violations found.
+    """
+    locked_paths = config.get("locked_paths", [])
+    if not locked_paths:
+        return True
+
+    violations = check_locked_paths_working_tree(locked_paths)
+
+    if violations:
+        print("LOCKED PATH VIOLATION — the following protected files have changes:")
+        for fpath, status in violations:
+            print(f"  [{status:>9s}] {fpath}")
+        print()
+        print("Revert these changes before running the controller.")
+        print("Aborting.")
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Fixture discovery
+# ---------------------------------------------------------------------------
+
+def discover_fixtures(fixtures_dir):
+    """
+    Find all fixture documents in the fixtures directory.
+    Returns list of absolute paths, sorted by name.
+    """
+    fixture_path = Path(fixtures_dir)
+    if not fixture_path.exists():
+        return []
+
+    valid_ext = {".docm", ".docx", ".doc"}
+    fixtures = []
+    for fpath in sorted(fixture_path.iterdir()):
+        if fpath.suffix.lower() in valid_ext and not fpath.name.startswith("~$"):
+            fixtures.append(str(fpath.resolve()))
+
+    return fixtures
+
+
+# ---------------------------------------------------------------------------
+# Kill Word
+# ---------------------------------------------------------------------------
+
+def kill_word():
+    """Force-kill all Word processes."""
+    subprocess.run(
+        ["taskkill", "/F", "/IM", "WINWORD.EXE"],
+        capture_output=True
+    )
+    time.sleep(2)
+
+
+# ---------------------------------------------------------------------------
+# Test execution (subprocess with real timeout)
+# ---------------------------------------------------------------------------
+
+def run_test_pass(config, iteration, results_dir):
+    """
+    Run one full test pass by spawning word_runner.py as a subprocess.
+    The controller enforces a real timeout — if the subprocess hangs,
+    it kills the process and Word.
+
+    Returns (all_passed: bool, report: dict).
+    """
+    timeout = config["controller"].get("timeout_seconds", 60)
+    visible = config["controller"].get("word_visible", False)
+    entry_sub = config["harness"].get("entry_sub", "RunAllTests")
+    kill_on_timeout = config["controller"].get("kill_on_timeout", True)
+
+    host_doc_path = str((PROJECT_ROOT / config["host_doc"]).resolve())
+    src_dir = str((PROJECT_ROOT / config.get("src_dir", "src")).resolve())
+    harness_dir = str((PROJECT_ROOT / config.get("harness_dir", "harness")).resolve())
+    fixtures_dir = str((PROJECT_ROOT / config.get("fixtures_dir", "tests/fixtures")).resolve())
+
+    result_file = str(results_dir / f"harness_output_{iteration:03d}.json")
+    runner_output = str(results_dir / f"runner_output_{iteration:03d}.json")
+
+    # Discover fixture documents
+    fixtures = discover_fixtures(fixtures_dir)
+
+    # Build the run config for word_runner.py
+    run_config = {
+        "host_doc_path": host_doc_path,
+        "src_dir": src_dir,
+        "harness_dir": harness_dir,
+        "entry_sub": entry_sub,
+        "word_visible": visible,
+        "result_file": result_file,
+        "runner_output_file": runner_output,
+        "fixtures": fixtures
+    }
+
+    run_config_path = str(results_dir / f"_run_config_{iteration:03d}.json")
+    with open(run_config_path, "w", encoding="utf-8") as f:
+        json.dump(run_config, f, indent=2)
+
+    # Spawn the worker subprocess
+    start = time.time()
+    word_killed = False
+    timed_out = False
+    error_msg = None
+    runner_result = None
+
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(WORD_RUNNER), run_config_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.kill()
+            proc.wait(timeout=5)
+
+            if kill_on_timeout:
+                kill_word()
+                word_killed = True
+
+            error_msg = f"TIMEOUT: test run exceeded {timeout}s limit"
+            if word_killed:
+                error_msg += " (Word killed)"
+
+    except Exception as e:
+        error_msg = f"Failed to spawn word_runner: {e}"
+
+    elapsed = time.time() - start
+
+    # Read runner output if it exists
+    if os.path.exists(runner_output):
+        try:
+            with open(runner_output, "r", encoding="utf-8") as f:
+                runner_result = json.load(f)
+        except Exception as e:
+            error_msg = error_msg or f"Failed to read runner output: {e}"
+
+    if runner_result and runner_result.get("error"):
+        error_msg = error_msg or runner_result["error"]
+
+    # Build fixture-centric report
+    report = build_report(
+        config, iteration, elapsed, fixtures,
+        runner_result, error_msg, timed_out, word_killed
+    )
+
+    return report["summary"]["all_passed"], report
+
+
+def build_report(config, iteration, elapsed, fixture_paths,
+                 runner_result, error_msg, timed_out, word_killed):
+    """
+    Build the canonical report structure.
+    Fixture-centric: each fixture gets a top-level entry with
+    name, status, elapsed, and errors.
+    """
+    fixture_results = []
+    tests = []
+
+    if runner_result:
+        tests = runner_result.get("tests", [])
+        raw_fixtures = runner_result.get("fixtures", [])
+
+        # Reshape raw fixture results into the canonical format
+        for rf in raw_fixtures:
+            name = rf.get("fixture", rf.get("name", "unknown"))
+            failed = rf.get("failed", 0)
+            fx_elapsed = rf.get("elapsed_seconds", 0)
+            fx_error = rf.get("error", "")
+
+            # Collect error messages for this fixture from the test list
+            errors = []
+            if fx_error:
+                errors.append(fx_error)
+            for t in tests:
+                if t.get("fixture") == name and not t.get("passed"):
+                    errors.append(f"{t.get('name', '?')}: {t.get('message', '')}")
+
+            fixture_results.append({
+                "name": name,
+                "status": "fail" if (failed > 0 or fx_error) else "pass",
+                "elapsed": fx_elapsed,
+                "passed": rf.get("passed", 0),
+                "failed": failed,
+                "errors": errors if errors else []
+            })
+
+    # Summarise fixtures
+    fx_total = len(fixture_results)
+    fx_passed = sum(1 for f in fixture_results if f["status"] == "pass")
+    fx_failed = sum(1 for f in fixture_results if f["status"] == "fail")
+
+    # Summarise all tests (including non-fixture smoke/logic tests)
+    test_total = len(tests)
+    test_passed = sum(1 for t in tests if t.get("passed"))
+    test_failed = sum(1 for t in tests if not t.get("passed"))
+
+    all_passed = (test_failed == 0 and test_total > 0
+                  and error_msg is None and not timed_out)
+
+    return {
+        "project": config["project_name"],
+        "iteration": iteration,
+        "timestamp": datetime.now().isoformat(),
+        "elapsed_seconds": round(elapsed, 3),
+        "error": error_msg,
+        "timed_out": timed_out,
+        "word_killed": word_killed,
+        "fixtures": fixture_results,
+        "tests": tests,
+        "summary": {
+            "fixtures_total": fx_total,
+            "fixtures_passed": fx_passed,
+            "fixtures_failed": fx_failed,
+            "tests_total": test_total,
+            "tests_passed": test_passed,
+            "tests_failed": test_failed,
+            "timed_out": 1 if timed_out else 0,
+            "all_passed": all_passed
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+def generate_summary(report):
+    """Generate a concise human-readable summary."""
+    lines = []
+    s = report["summary"]
+    elapsed = report["elapsed_seconds"]
+
+    lines.append("Run summary")
+    lines.append("-----------")
+    lines.append(f"iteration: {report['iteration']}")
+    lines.append(f"fixtures:  {s['fixtures_total']}")
+    lines.append(f"tests:     {s['tests_total']}")
+    lines.append(f"passed:    {s['tests_passed']}")
+    lines.append(f"failed:    {s['tests_failed']}")
+    lines.append(f"timeouts:  {s['timed_out']}")
+    lines.append(f"elapsed:   {elapsed:.1f}s")
+
+    if report.get("word_killed"):
+        lines.append("word:      killed")
+
+    if report.get("error"):
+        lines.append(f"error:     {report['error']}")
+
+    # Failed fixtures
+    failed_fixtures = [f for f in report.get("fixtures", []) if f["status"] == "fail"]
+    if failed_fixtures:
+        lines.append("")
+        lines.append("Failed fixtures:")
+        for f in failed_fixtures:
+            lines.append(f"  - {f['name']}")
+
+    # Failed tests (including non-fixture)
+    failed_tests = [t for t in report.get("tests", []) if not t.get("passed")]
+    if failed_tests:
+        lines.append("")
+        lines.append("Failed tests:")
+        for t in failed_tests:
+            name = t.get("name", "?")
+            msg = t.get("message", "")
+            fixture = t.get("fixture", "")
+            line = f"  - {name}"
+            if fixture:
+                line += f" [{fixture}]"
+            if msg:
+                line += f" — {msg}"
+            lines.append(line)
+
+    lines.append("")
+    lines.append(f"result: {'PASS' if s['all_passed'] else 'FAIL'}")
+    lines.append(f"report: results/report_{report['iteration']:03d}.json")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Repair prompt generation
+# ---------------------------------------------------------------------------
+
+def generate_repair_prompt(report, config, iteration):
+    """Generate a repair prompt file for Claude Code CLI."""
+    template_path = PROJECT_ROOT / "controller" / "templates" / "repair_prompt.md"
+    if template_path.exists():
+        with open(template_path, "r", encoding="utf-8") as f:
+            template = f.read()
+    else:
+        template = DEFAULT_REPAIR_TEMPLATE
+
+    failed_tests = [t for t in report.get("tests", []) if not t.get("passed")]
+
+    mutable = config.get("mutable_paths", ["src/"])
+    locked = config.get("locked_paths", [])
+
+    prompt = template.format(
+        iteration=iteration,
+        max_iterations=config["controller"]["max_iterations"],
+        failed_count=len(failed_tests),
+        total_count=report["summary"]["tests_total"],
+        failed_tests_json=json.dumps(failed_tests, indent=2),
+        error_message=report.get("error") or "None",
+        mutable_paths="\n".join(f"  - `{p}`" for p in mutable),
+        locked_paths="\n".join(f"  - `{p}`" for p in locked),
+        elapsed=report["elapsed_seconds"],
+        timed_out="Yes" if report.get("timed_out") else "No",
+        word_killed="Yes" if report.get("word_killed") else "No",
+        full_report_json=json.dumps(report, indent=2)
+    )
+
+    return prompt
+
+
+DEFAULT_REPAIR_TEMPLATE = """# VBA Repair Prompt — Iteration {iteration}/{max_iterations}
+
+## Status
+- **{failed_count}** of **{total_count}** tests failed
+- Elapsed: {elapsed}s
+- Timed out: {timed_out}
+- Word killed: {word_killed}
+- Error: {error_message}
+
+## Rules
+You may modify files under these paths:
+{mutable_paths}
+
+You must NOT modify these protected paths:
+{locked_paths}
+
+Make minimal, targeted fixes. Do not refactor unrelated code.
+
+## Failed Tests
+```json
+{failed_tests_json}
+```
+
+## Full Test Report
+```json
+{full_report_json}
+```
+
+## Instructions
+1. Read the failing test details above carefully.
+2. Read the relevant source files.
+3. Identify the root cause of each failure.
+4. Make minimal, targeted fixes.
+5. Save all modified files when done.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Main controller loop
+# ---------------------------------------------------------------------------
+
+def main():
+    config = load_config()
+    max_iters = config["controller"]["max_iterations"]
+    timeout = config["controller"]["timeout_seconds"]
+    results_dir = PROJECT_ROOT / config.get("results_dir", "results")
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Verify host document exists
+    host_doc = PROJECT_ROOT / config["host_doc"]
+    if not host_doc.exists():
+        print(f"Error: Host document not found: {host_doc}")
+        print(f"Create a macro-enabled document at: {host_doc}")
+        sys.exit(1)
+
+    # Verify fixtures directory
+    fixtures_dir = PROJECT_ROOT / config.get("fixtures_dir", "tests/fixtures")
+    fixtures = discover_fixtures(str(fixtures_dir))
+
+    print("=" * 50)
+    print("Word VBA Patch Automator")
+    print(f"Project:   {config['project_name']}")
+    print(f"Host doc:  {host_doc}")
+    print(f"Fixtures:  {len(fixtures)} in {fixtures_dir}")
+    print(f"Timeout:   {timeout}s")
+    print(f"Max iters: {max_iters}")
+    print("=" * 50)
+
+    if not fixtures:
+        print(f"\nWarning: No fixture documents found in {fixtures_dir}")
+        print("Fixture-based tests will be skipped.")
+
+    # Check locked paths BEFORE running
+    if not check_locked_paths(config):
+        sys.exit(1)
+
+    run_reports = []
+
+    for iteration in range(1, max_iters + 1):
+        print(f"\n--- Iteration {iteration}/{max_iters} ---")
+
+        all_passed, report = run_test_pass(config, iteration, results_dir)
+        run_reports.append(report)
+
+        # Write detailed JSON report
+        report_file = results_dir / f"report_{iteration:03d}.json"
+        with open(report_file, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+
+        # Write + print human summary
+        summary = generate_summary(report)
+        summary_file = results_dir / f"summary_{iteration:03d}.txt"
+        with open(summary_file, "w", encoding="utf-8") as f:
+            f.write(summary)
+        print(summary)
+
+        if all_passed:
+            print(f"\nAll tests passed on iteration {iteration}. Done!")
+            break
+
+        if iteration < max_iters:
+            prompt = generate_repair_prompt(report, config, iteration)
+            prompt_file = results_dir / f"repair_prompt_{iteration:03d}.md"
+            with open(prompt_file, "w", encoding="utf-8") as f:
+                f.write(prompt)
+            print(f"\nRepair prompt: {prompt_file}")
+            print("[Semi-automatic] Run Claude Code CLI, then re-run the controller:")
+            print(f"  claude -p {prompt_file}")
+            break
+        else:
+            print(f"\nMax iterations ({max_iters}) reached. Tests still failing.")
+
+    # Write combined run log
+    combined_file = results_dir / "run_log.json"
+    with open(combined_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "project": config["project_name"],
+            "timestamp": datetime.now().isoformat(),
+            "iterations": run_reports
+        }, f, indent=2)
+
+    print(f"\nRun log: {combined_file}")
+
+    # Regenerate the whole-project code export
+    refresh_code_export()
+
+
+def refresh_code_export():
+    """Regenerate project_code_export.txt so it stays current with every patch."""
+    export_script = PROJECT_ROOT / "export_all_code.py"
+    if export_script.exists():
+        try:
+            subprocess.run(
+                [sys.executable, str(export_script)],
+                cwd=str(PROJECT_ROOT),
+                capture_output=True, timeout=10
+            )
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
+
+==============================================================================
+  FILE 7: controller/word_runner.py
+==============================================================================
+
+"""
+Word Runner — subprocess worker for COM automation.
+
+Called by the controller as a child process. This is the process boundary
+that allows the controller to enforce a real timeout: if this process
+hangs inside a Word COM call, the controller can kill it and Word.
+
+Usage (called by controller, not directly):
+    python word_runner.py <config_json_path>
+
+The config_json_path points to a temporary JSON file with run parameters.
+Results are written to the path specified in that config.
+
+Exit codes:
+    0 = completed (check result JSON for pass/fail)
+    1 = error (error details in result JSON)
+"""
+
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+
+def get_word_app(visible=False):
+    """Launch a fresh Word instance via COM."""
+    import win32com.client
+    word = win32com.client.Dispatch("Word.Application")
+    word.Visible = visible
+    word.DisplayAlerts = 0  # wdAlertsNone
+    return word
+
+
+def import_vba_modules(doc, src_dir):
+    """Import .bas/.cls/.frm from src_dir into doc, replacing existing."""
+    vb_project = doc.VBProject
+    src_path = Path(src_dir)
+    valid_ext = {".bas", ".cls", ".frm"}
+    imported = []
+
+    for fpath in sorted(src_path.iterdir()):
+        if fpath.is_dir() or fpath.suffix.lower() not in valid_ext:
+            continue
+
+        mod_name = fpath.stem
+
+        # Remove existing module if present (skip document modules type=100)
+        try:
+            existing = vb_project.VBComponents(mod_name)
+            if existing.Type != 100:
+                vb_project.VBComponents.Remove(existing)
+                time.sleep(0.3)
+        except Exception:
+            pass
+
+        vb_project.VBComponents.Import(str(fpath.resolve()))
+        imported.append(fpath.name)
+
+    return imported
+
+
+def run(run_config):
+    """
+    Execute one test run:
+      1. Open the host document
+      2. Import VBA source + harness modules
+      3. Run the harness entry sub (which iterates fixtures internally)
+      4. Read the result file written by the harness
+      5. Write a combined result JSON for the controller
+
+    The VBA harness receives fixture paths and result path via a config
+    file at a well-known location.
+    """
+    word = None
+    host_doc = None
+
+    result = {
+        "status": "error",
+        "error": None,
+        "elapsed_seconds": 0,
+        "fixtures": [],
+        "tests": [],
+        "timestamp": datetime.now().isoformat()
+    }
+
+    start = time.time()
+
+    try:
+        visible = run_config.get("word_visible", False)
+        host_doc_path = run_config["host_doc_path"]
+        src_dir = run_config["src_dir"]
+        harness_dir = run_config["harness_dir"]
+        entry_sub = run_config.get("entry_sub", "RunAllTests")
+        result_file = run_config["result_file"]
+        fixtures = run_config.get("fixtures", [])
+
+        # Write harness config to TEMP so VBA can find it reliably
+        temp_dir = os.environ.get("TEMP", os.environ.get("TMP", "."))
+        harness_config_path = os.path.join(temp_dir, "_harness_config.json")
+        harness_config = {
+            "result_file": result_file,
+            "fixtures": fixtures
+        }
+        with open(harness_config_path, "w", encoding="utf-8") as f:
+            json.dump(harness_config, f)
+
+        # Also set env vars for VBA Environ() access
+        os.environ["TEST_RESULT_PATH"] = result_file
+        os.environ["TEST_HARNESS_CONFIG"] = harness_config_path
+
+        # Delete old result file
+        if os.path.exists(result_file):
+            os.unlink(result_file)
+
+        # Start Word
+        word = get_word_app(visible=visible)
+
+        # Open host document
+        if not os.path.exists(host_doc_path):
+            result["error"] = f"Host document not found: {host_doc_path}"
+            return result
+
+        host_doc = word.Documents.Open(host_doc_path)
+
+        # Import VBA source modules
+        imported_src = import_vba_modules(host_doc, src_dir)
+
+        # Import harness modules
+        imported_harness = import_vba_modules(host_doc, harness_dir)
+
+        # Run the test harness
+        word.Run(entry_sub)
+
+        elapsed = time.time() - start
+        result["elapsed_seconds"] = round(elapsed, 3)
+
+        # Read the result file written by the harness
+        if os.path.exists(result_file):
+            with open(result_file, "r", encoding="utf-8") as f:
+                harness_output = json.load(f)
+            result["status"] = "completed"
+            result["tests"] = harness_output.get("tests", [])
+            result["fixtures"] = harness_output.get("fixtures", [])
+            result["harness_output"] = harness_output
+        else:
+            result["error"] = "Harness did not produce a result file"
+
+    except Exception as e:
+        result["elapsed_seconds"] = round(time.time() - start, 3)
+        result["error"] = str(e)
+
+    finally:
+        try:
+            if host_doc:
+                host_doc.Close(0)  # wdDoNotSaveChanges
+        except Exception:
+            pass
+        try:
+            if word:
+                word.Quit()
+        except Exception:
+            pass
+
+    return result
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: word_runner.py <run_config.json>", file=sys.stderr)
+        sys.exit(1)
+
+    config_path = sys.argv[1]
+    with open(config_path, "r", encoding="utf-8") as f:
+        run_config = json.load(f)
+
+    output_path = run_config["runner_output_file"]
+
+    result = run(run_config)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+
+    sys.exit(0 if result["status"] == "completed" else 1)
+
+
+if __name__ == "__main__":
+    main()
+
+==============================================================================
+  FILE 8: controller/vba_io.py
+==============================================================================
+
+"""
+VBA Import / Export utility — standalone script for manual use.
+
+Usage:
+    python vba_io.py import          Import src/ modules into the host document
+    python vba_io.py export          Export VBA modules from the host document to src/
+    python vba_io.py export-all      Export all modules including harness/test modules
+    python vba_io.py roundtrip       Export then import (useful for normalising)
+
+Options:
+    --visible       Show Word window during operation
+    --doc PATH      Override host document path (relative to project root)
+
+Runs inside Windows with pywin32 installed.
+"""
+
+import json
+import sys
+import time
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+
+
+def load_config():
+    with open(PROJECT_ROOT / "project.json", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_word_app(visible=False):
+    import win32com.client
+    word = win32com.client.Dispatch("Word.Application")
+    word.Visible = visible
+    word.DisplayAlerts = 0
+    return word
+
+
+def import_modules(doc, src_dir):
+    """Import .bas/.cls/.frm files from src_dir, replacing existing modules."""
+    vb_project = doc.VBProject
+    src_path = Path(src_dir)
+    valid_ext = {".bas", ".cls", ".frm"}
+    imported = []
+
+    for fpath in sorted(src_path.iterdir()):
+        if fpath.is_dir() or fpath.suffix.lower() not in valid_ext:
+            continue
+
+        mod_name = fpath.stem
+
+        # Remove existing (skip document modules type=100)
+        try:
+            existing = vb_project.VBComponents(mod_name)
+            if existing.Type != 100:
+                vb_project.VBComponents.Remove(existing)
+                time.sleep(0.3)
+        except Exception:
+            pass
+
+        vb_project.VBComponents.Import(str(fpath.resolve()))
+        imported.append(fpath.name)
+        print(f"  Imported: {fpath.name}")
+
+    return imported
+
+
+def export_modules(doc, dest_dir, include_tests=False):
+    """Export VBA components to dest_dir."""
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    ext_map = {1: ".bas", 2: ".cls", 3: ".frm"}
+    exported = []
+
+    for comp in doc.VBProject.VBComponents:
+        comp_type = comp.Type
+        if comp_type == 100:  # Document module — skip
+            continue
+
+        # Optionally skip test/harness modules
+        if not include_tests:
+            if comp.Name.startswith("Test_") or comp.Name == "TestHarness":
+                continue
+
+        ext = ext_map.get(comp_type)
+        if ext is None:
+            continue
+
+        out_path = dest / (comp.Name + ext)
+        comp.Export(str(out_path.resolve()))
+        exported.append(out_path.name)
+        print(f"  Exported: {out_path.name}")
+
+    return exported
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python vba_io.py [import|export|export-all|roundtrip] [--visible] [--doc PATH]")
+        sys.exit(1)
+
+    action = sys.argv[1].lower()
+    config = load_config()
+    visible = "--visible" in sys.argv
+
+    # Allow --doc override
+    doc_override = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--doc" and i + 1 < len(sys.argv):
+            doc_override = sys.argv[i + 1]
+
+    doc_rel = doc_override or config["host_doc"]
+    word_doc_path = (PROJECT_ROOT / doc_rel).resolve()
+    src_dir = (PROJECT_ROOT / config.get("src_dir", "src")).resolve()
+
+    if not word_doc_path.exists():
+        print(f"Error: Document not found: {word_doc_path}")
+        sys.exit(1)
+
+    print(f"Document: {word_doc_path}")
+    print(f"Opening Word (visible={visible})...")
+    word = get_word_app(visible=visible)
+
+    try:
+        doc = word.Documents.Open(str(word_doc_path))
+
+        if action == "import":
+            print(f"Importing from {src_dir}...")
+            imported = import_modules(doc, src_dir)
+            doc.Save()
+            print(f"Done. Imported {len(imported)} module(s).")
+
+        elif action == "export":
+            print(f"Exporting to {src_dir}...")
+            exported = export_modules(doc, src_dir, include_tests=False)
+            print(f"Done. Exported {len(exported)} module(s).")
+
+        elif action == "export-all":
+            print(f"Exporting all modules to {src_dir}...")
+            exported = export_modules(doc, src_dir, include_tests=True)
+            print(f"Done. Exported {len(exported)} module(s).")
+
+        elif action == "roundtrip":
+            print("Exporting...")
+            export_modules(doc, src_dir, include_tests=False)
+            print("Re-importing...")
+            import_modules(doc, src_dir)
+            doc.Save()
+            print("Roundtrip complete.")
+
+        else:
+            print(f"Unknown action: {action}")
+            sys.exit(1)
+
+        doc.Close(0)
+
+    finally:
+        try:
+            word.Quit()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
+
+==============================================================================
+  FILE 9: controller/__init__.py
+==============================================================================
+
+==============================================================================
+  FILE 10: controller/templates/repair_prompt.md
+==============================================================================
+
+# VBA Repair Prompt — Iteration {iteration}/{max_iterations}
+
+## Status
+- **{failed_count}** of **{total_count}** tests failed
+- Elapsed: {elapsed}s
+- Timed out: {timed_out}
+- Word killed: {word_killed}
+- Error: {error_message}
+
+## Rules
+You may modify files under these paths:
+{mutable_paths}
+
+You must NOT modify these protected paths:
+{locked_paths}
+
+Make minimal, targeted fixes. Do not refactor unrelated code.
+
+## Failed Tests
+
+```json
+{failed_tests_json}
+```
+
+## Full Test Report
+
+```json
+{full_report_json}
+```
+
+## Instructions
+1. Read the failing test details above carefully.
+2. Read the relevant source files.
+3. Identify the root cause of each failure.
+4. Make minimal, targeted fixes.
+5. Save all modified files when done.
+
+==============================================================================
+  FILE 11: harness/TestHarness.bas
+==============================================================================
+
+Attribute VB_Name = "TestHarness"
+'===========================================================================
+' TestHarness — MVP VBA Test Runner with Fixture Support
+'
+' Called by the controller. Runs all Test_* modules, including:
+'   - Smoke tests (no fixture needed)
+'   - Logic tests (no fixture needed)
+'   - Fixture-based tests (iterated over each fixture document)
+'
+' Config is read from:
+'   1. Environ("TEST_RESULT_PATH") — where to write results
+'   2. Environ("TEST_HARNESS_CONFIG") — path to JSON with fixture list
+'   Fallback: %TEMP%\_harness_config.json
+'
+' Test naming conventions:
+'   Sub Test_<Category>_<Name>()       — runs once (no fixture)
+'   Sub TestFixture_<Category>_<Name>(doc As Document)
+'       — runs once per fixture document
+'===========================================================================
+Option Explicit
+
+' --- Internal state ---
+Private p_Results As Collection
+Private p_FixtureResults As Collection
+Private p_CurrentTest As String
+Private p_CurrentPassed As Boolean
+Private p_CurrentMessage As String
+Private p_TestStartTime As Double
+Private p_RunStartTime As Double
+Private p_CurrentFixture As String
+
+'===========================================================================
+' Entry point
+'===========================================================================
+Public Sub RunAllTests()
+    Dim resultPath As String
+    Dim configPath As String
+    Dim fixtures() As String
+    Dim fixtureCount As Long
+
+    ' Resolve result path
+    resultPath = Environ("TEST_RESULT_PATH")
+    If resultPath = "" Then
+        resultPath = ReadConfigValue("result_file")
+    End If
+    If resultPath = "" Then
+        MsgBox "TEST_RESULT_PATH not set and no config found.", vbCritical
+        Exit Sub
+    End If
+
+    ' Resolve fixture list
+    fixtures = ReadFixtureList()
+    fixtureCount = UBound(fixtures) - LBound(fixtures) + 1
+    If fixtureCount = 1 And fixtures(0) = "" Then fixtureCount = 0
+
+    ' Initialize
+    Set p_Results = New Collection
+    Set p_FixtureResults = New Collection
+    p_RunStartTime = Timer
+    p_CurrentFixture = ""
+
+    ' --- Phase 1: Run non-fixture tests (smoke, logic) ---
+    RunSmokeTests
+    RunNonFixtureTests
+
+    ' --- Phase 2: Run fixture-based tests ---
+    If fixtureCount > 0 Then
+        Dim i As Long
+        For i = LBound(fixtures) To UBound(fixtures)
+            If fixtures(i) <> "" Then
+                RunFixtureTests fixtures(i)
+            End If
+        Next i
+    End If
+
+    ' --- Write results ---
+    Dim totalElapsed As Double
+    totalElapsed = Timer - p_RunStartTime
+    WriteResultsJSON resultPath, totalElapsed, fixtures
+End Sub
+
+'===========================================================================
+' Run all non-fixture Test_* subs across all Test_* modules
+'===========================================================================
+Private Sub RunNonFixtureTests()
+    Dim proj As Object
+    Set proj = ThisDocument.VBProject
+
+    Dim i As Long
+    For i = 1 To proj.VBComponents.Count
+        Dim comp As Object
+        Set comp = proj.VBComponents(i)
+        If Left$(comp.Name, 5) = "Test_" Then
+            RunNonFixtureTestsInModule comp
+        End If
+    Next i
+End Sub
+
+Private Sub RunNonFixtureTestsInModule(comp As Object)
+    Dim codeModule As Object
+    Set codeModule = comp.CodeModule
+
+    Dim lineNum As Long
+    For lineNum = 1 To codeModule.CountOfLines
+        Dim lineText As String
+        lineText = Trim$(codeModule.Lines(lineNum, 1))
+
+        Dim subName As String
+        subName = ExtractSubName(lineText, "Test_")
+
+        ' Skip fixture-based subs (TestFixture_*)
+        If subName <> "" And Left$(subName, 12) <> "TestFixture_" Then
+            RunSingleTest comp.Name & "." & subName, subName, ""
+        End If
+    Next lineNum
+End Sub
+
+'===========================================================================
+' Run fixture-based tests for one fixture document
+'===========================================================================
+Private Sub RunFixtureTests(fixturePath As String)
+    Dim fixtureDoc As Document
+    Dim fixtureName As String
+    fixtureName = Mid$(fixturePath, InStrRev(fixturePath, "\") + 1)
+
+    Dim fixtureStart As Double
+    fixtureStart = Timer
+
+    Dim fixtureError As String
+    fixtureError = ""
+
+    ' Open the fixture document (read-only to keep it immutable)
+    On Error Resume Next
+    Set fixtureDoc = Application.Documents.Open( _
+        FileName:=fixturePath, _
+        ReadOnly:=True, _
+        AddToRecentFiles:=False)
+    If Err.Number <> 0 Then
+        fixtureError = "Cannot open fixture: " & Err.Description
+        On Error GoTo 0
+
+        ' Record a single failure for this fixture
+        RecordResult "Fixture_Open." & fixtureName, False, fixtureError, 0, False, fixtureName
+        RecordFixtureResult fixtureName, 0, 0, 1, Timer - fixtureStart, fixtureError
+        Exit Sub
+    End If
+    On Error GoTo 0
+
+    p_CurrentFixture = fixtureName
+
+    ' Find and run all TestFixture_* subs, passing the fixture doc
+    Dim proj As Object
+    Set proj = ThisDocument.VBProject
+    Dim passCount As Long, failCount As Long
+    passCount = 0: failCount = 0
+
+    Dim i As Long
+    For i = 1 To proj.VBComponents.Count
+        Dim comp As Object
+        Set comp = proj.VBComponents(i)
+        If Left$(comp.Name, 5) = "Test_" Then
+            RunFixtureTestsInModule comp, fixtureDoc, fixtureName, passCount, failCount
+        End If
+    Next i
+
+    ' Close fixture document without saving
+    On Error Resume Next
+    fixtureDoc.Close SaveChanges:=False
+    On Error GoTo 0
+
+    p_CurrentFixture = ""
+
+    Dim fixtureElapsed As Double
+    fixtureElapsed = Timer - fixtureStart
+    RecordFixtureResult fixtureName, passCount, failCount, passCount + failCount, fixtureElapsed, ""
+End Sub
+
+Private Sub RunFixtureTestsInModule(comp As Object, fixtureDoc As Document, fixtureName As String, ByRef passCount As Long, ByRef failCount As Long)
+    Dim codeModule As Object
+    Set codeModule = comp.CodeModule
+
+    Dim lineNum As Long
+    For lineNum = 1 To codeModule.CountOfLines
+        Dim lineText As String
+        lineText = Trim$(codeModule.Lines(lineNum, 1))
+
+        Dim subName As String
+        subName = ExtractSubName(lineText, "TestFixture_")
+        If subName <> "" Then
+            ' Run the fixture test, passing the doc as argument
+            Dim beforeCount As Long
+            beforeCount = p_Results.Count
+
+            RunSingleFixtureTest comp.Name & "." & subName, subName, fixtureDoc, fixtureName
+
+            ' Check if it passed (look at the last added result)
+            If p_Results.Count > beforeCount Then
+                Dim lastResult As String
+                lastResult = p_Results(p_Results.Count)
+                If InStr(1, lastResult, """passed"": true") > 0 Then
+                    passCount = passCount + 1
+                Else
+                    failCount = failCount + 1
+                End If
+            End If
+        End If
+    Next lineNum
+End Sub
+
+'===========================================================================
+' Run a single non-fixture test
+'===========================================================================
+Private Sub RunSingleTest(displayName As String, subName As String, fixtureName As String)
+    p_CurrentTest = displayName
+    p_CurrentPassed = True
+    p_CurrentMessage = ""
+    p_TestStartTime = Timer
+
+    On Error GoTo TestErr
+    Application.Run subName
+    GoTo TestEnd
+
+TestErr:
+    p_CurrentPassed = False
+    p_CurrentMessage = "Runtime error " & Err.Number & ": " & Err.Description
+    Resume TestEnd
+
+TestEnd:
+    On Error GoTo 0
+    Dim elapsed As Double
+    elapsed = Timer - p_TestStartTime
+    RecordResult p_CurrentTest, p_CurrentPassed, p_CurrentMessage, elapsed * 1000, False, fixtureName
+End Sub
+
+'===========================================================================
+' Run a single fixture test (passes Document argument)
+'===========================================================================
+Private Sub RunSingleFixtureTest(displayName As String, subName As String, fixtureDoc As Document, fixtureName As String)
+    p_CurrentTest = displayName
+    p_CurrentPassed = True
+    p_CurrentMessage = ""
+    p_TestStartTime = Timer
+
+    On Error GoTo FTestErr
+    Application.Run subName, fixtureDoc
+    GoTo FTestEnd
+
+FTestErr:
+    p_CurrentPassed = False
+    p_CurrentMessage = "Runtime error " & Err.Number & ": " & Err.Description
+    Resume FTestEnd
+
+FTestEnd:
+    On Error GoTo 0
+    Dim elapsed As Double
+    elapsed = Timer - p_TestStartTime
+    RecordResult p_CurrentTest, p_CurrentPassed, p_CurrentMessage, elapsed * 1000, False, fixtureName
+End Sub
+
+'===========================================================================
+' Built-in smoke tests
+'===========================================================================
+Private Sub RunSmokeTests()
+    ' Smoke: VBA environment
+    p_CurrentTest = "Smoke_VBAEnvironment"
+    p_CurrentPassed = True
+    p_CurrentMessage = ""
+    p_TestStartTime = Timer
+    Dim x As Long: x = 1 + 1
+    If x <> 2 Then
+        p_CurrentPassed = False
+        p_CurrentMessage = "Basic arithmetic failed"
+    End If
+    RecordResult "Smoke_VBAEnvironment", p_CurrentPassed, p_CurrentMessage, (Timer - p_TestStartTime) * 1000, False, ""
+
+    ' Smoke: host document accessible
+    p_CurrentTest = "Smoke_HostDocument"
+    p_CurrentPassed = True
+    p_CurrentMessage = ""
+    p_TestStartTime = Timer
+    On Error Resume Next
+    Dim n As String: n = ThisDocument.Name
+    If Err.Number <> 0 Then
+        p_CurrentPassed = False
+        p_CurrentMessage = "Cannot access ThisDocument: " & Err.Description
+    End If
+    On Error GoTo 0
+    RecordResult "Smoke_HostDocument", p_CurrentPassed, p_CurrentMessage, (Timer - p_TestStartTime) * 1000, False, ""
+End Sub
+
+'===========================================================================
+' Assert helpers
+'===========================================================================
+Public Sub AssertTrue(condition As Boolean, Optional msg As String = "")
+    If Not condition Then
+        p_CurrentPassed = False
+        p_CurrentMessage = IIf(msg <> "", msg, "AssertTrue failed")
+    End If
+End Sub
+
+Public Sub AssertFalse(condition As Boolean, Optional msg As String = "")
+    AssertTrue Not condition, IIf(msg <> "", msg, "AssertFalse failed")
+End Sub
+
+Public Sub AssertEqual(expected As Variant, actual As Variant, Optional msg As String = "")
+    If expected <> actual Then
+        p_CurrentPassed = False
+        If msg <> "" Then
+            p_CurrentMessage = msg
+        Else
+            p_CurrentMessage = "Expected [" & CStr(expected) & "] but got [" & CStr(actual) & "]"
+        End If
+    End If
+End Sub
+
+Public Sub AssertNotEqual(notExpected As Variant, actual As Variant, Optional msg As String = "")
+    If notExpected = actual Then
+        p_CurrentPassed = False
+        If msg <> "" Then
+            p_CurrentMessage = msg
+        Else
+            p_CurrentMessage = "Expected value to differ from [" & CStr(notExpected) & "]"
+        End If
+    End If
+End Sub
+
+Public Sub AssertContains(haystack As String, needle As String, Optional msg As String = "")
+    If InStr(1, haystack, needle, vbTextCompare) = 0 Then
+        p_CurrentPassed = False
+        If msg <> "" Then
+            p_CurrentMessage = msg
+        Else
+            p_CurrentMessage = "String does not contain [" & needle & "]"
+        End If
+    End If
+End Sub
+
+Public Sub Fail(msg As String)
+    p_CurrentPassed = False
+    p_CurrentMessage = msg
+End Sub
+
+'===========================================================================
+' Result recording
+'===========================================================================
+Private Sub RecordResult(testName As String, passed As Boolean, message As String, durationMs As Double, timedOut As Boolean, fixtureName As String)
+    Dim r As String
+    r = "{"
+    r = r & """name"": " & JsonStr(testName) & ", "
+    r = r & """passed"": " & IIf(passed, "true", "false") & ", "
+    r = r & """message"": " & JsonStr(message) & ", "
+    r = r & """duration_ms"": " & Format$(durationMs, "0.0") & ", "
+    r = r & """timed_out"": " & IIf(timedOut, "true", "false") & ", "
+    r = r & """fixture"": " & JsonStr(fixtureName)
+    r = r & "}"
+    p_Results.Add r
+End Sub
+
+Private Sub RecordFixtureResult(fixtureName As String, passed As Long, failed As Long, total As Long, elapsedSec As Double, errorMsg As String)
+    Dim r As String
+    r = "{"
+    r = r & """fixture"": " & JsonStr(fixtureName) & ", "
+    r = r & """passed"": " & passed & ", "
+    r = r & """failed"": " & failed & ", "
+    r = r & """total"": " & total & ", "
+    r = r & """elapsed_seconds"": " & Format$(elapsedSec, "0.000") & ", "
+    r = r & """error"": " & JsonStr(errorMsg)
+    r = r & "}"
+    p_FixtureResults.Add r
+End Sub
+
+'===========================================================================
+' Extract sub name matching a prefix pattern
+'===========================================================================
+Private Function ExtractSubName(lineText As String, prefix As String) As String
+    Dim cleaned As String
+    cleaned = Trim$(lineText)
+
+    ' Remove "Public " if present
+    If Left$(LCase$(cleaned), 7) = "public " Then
+        cleaned = Trim$(Mid$(cleaned, 8))
+    End If
+
+    ' Must start with "Sub <prefix>"
+    Dim target As String
+    target = "sub " & LCase$(prefix)
+    If Left$(LCase$(cleaned), Len(target)) <> target Then
+        ExtractSubName = ""
+        Exit Function
+    End If
+
+    ' Extract sub name after "Sub "
+    Dim subPart As String
+    subPart = Mid$(cleaned, 5) ' skip "Sub "
+
+    Dim parenPos As Long
+    parenPos = InStr(subPart, "(")
+    If parenPos > 0 Then
+        subPart = Left$(subPart, parenPos - 1)
+    End If
+
+    ExtractSubName = Trim$(subPart)
+End Function
+
+'===========================================================================
+' JSON output
+'===========================================================================
+Private Sub WriteResultsJSON(filePath As String, totalElapsed As Double, fixtures() As String)
+    Dim fNum As Integer
+    fNum = FreeFile
+
+    Open filePath For Output As #fNum
+
+    Print #fNum, "{"
+    Print #fNum, "  ""harness_version"": ""mvp-2.0"","
+    Print #fNum, "  ""timestamp"": """ & Format$(Now, "yyyy-mm-dd hh:nn:ss") & ""","
+    Print #fNum, "  ""total_elapsed_seconds"": " & Format$(totalElapsed, "0.000") & ","
+
+    ' Count pass/fail
+    Dim passCount As Long, failCount As Long
+    passCount = 0: failCount = 0
+    Dim idx As Long
+    For idx = 1 To p_Results.Count
+        If InStr(1, p_Results(idx), """passed"": true") > 0 Then
+            passCount = passCount + 1
+        Else
+            failCount = failCount + 1
+        End If
+    Next idx
+
+    Print #fNum, "  ""test_count"": " & p_Results.Count & ","
+    Print #fNum, "  ""passed"": " & passCount & ","
+    Print #fNum, "  ""failed"": " & failCount & ","
+
+    ' Fixture results
+    Print #fNum, "  ""fixtures"": ["
+    For idx = 1 To p_FixtureResults.Count
+        If idx < p_FixtureResults.Count Then
+            Print #fNum, "    " & p_FixtureResults(idx) & ","
+        Else
+            Print #fNum, "    " & p_FixtureResults(idx)
+        End If
+    Next idx
+    Print #fNum, "  ],"
+
+    ' Test results
+    Print #fNum, "  ""tests"": ["
+    For idx = 1 To p_Results.Count
+        If idx < p_Results.Count Then
+            Print #fNum, "    " & p_Results(idx) & ","
+        Else
+            Print #fNum, "    " & p_Results(idx)
+        End If
+    Next idx
+    Print #fNum, "  ]"
+
+    Print #fNum, "}"
+
+    Close #fNum
+End Sub
+
+'===========================================================================
+' Config reading helpers
+'===========================================================================
+Private Function ReadConfigValue(key As String) As String
+    ' Read a value from the harness config JSON
+    Dim content As String
+    content = ReadConfigFile()
+    If content = "" Then
+        ReadConfigValue = ""
+        Exit Function
+    End If
+
+    Dim searchKey As String
+    searchKey = """" & key & """"
+
+    Dim startPos As Long
+    startPos = InStr(1, content, searchKey)
+    If startPos = 0 Then
+        ReadConfigValue = ""
+        Exit Function
+    End If
+
+    startPos = InStr(startPos, content, ":") + 1
+    startPos = InStr(startPos, content, """") + 1
+    Dim endPos As Long
+    endPos = InStr(startPos, content, """")
+
+    If startPos > 1 And endPos > startPos Then
+        ReadConfigValue = Mid$(content, startPos, endPos - startPos)
+    Else
+        ReadConfigValue = ""
+    End If
+End Function
+
+Private Function ReadFixtureList() As String()
+    ' Read fixture paths from harness config
+    Dim content As String
+    content = ReadConfigFile()
+
+    Dim emptyArr(0) As String
+    emptyArr(0) = ""
+
+    If content = "" Then
+        ReadFixtureList = emptyArr
+        Exit Function
+    End If
+
+    ' Find "fixtures": [...]
+    Dim startPos As Long
+    startPos = InStr(1, content, """fixtures""")
+    If startPos = 0 Then
+        ReadFixtureList = emptyArr
+        Exit Function
+    End If
+
+    startPos = InStr(startPos, content, "[")
+    If startPos = 0 Then
+        ReadFixtureList = emptyArr
+        Exit Function
+    End If
+
+    Dim endPos As Long
+    endPos = InStr(startPos, content, "]")
+    If endPos = 0 Then
+        ReadFixtureList = emptyArr
+        Exit Function
+    End If
+
+    ' Extract the array content between [ and ]
+    Dim arrContent As String
+    arrContent = Mid$(content, startPos + 1, endPos - startPos - 1)
+
+    ' Split by comma, extract quoted strings
+    Dim parts() As String
+    parts = Split(arrContent, ",")
+
+    Dim count As Long
+    count = 0
+    Dim i As Long
+
+    ' First pass: count non-empty entries
+    For i = LBound(parts) To UBound(parts)
+        Dim cleaned As String
+        cleaned = Trim$(parts(i))
+        cleaned = Replace(cleaned, """", "")
+        cleaned = Replace(cleaned, vbLf, "")
+        cleaned = Replace(cleaned, vbCr, "")
+        cleaned = Trim$(cleaned)
+        If cleaned <> "" Then count = count + 1
+    Next i
+
+    If count = 0 Then
+        ReadFixtureList = emptyArr
+        Exit Function
+    End If
+
+    ReDim result(0 To count - 1) As String
+    Dim j As Long: j = 0
+    For i = LBound(parts) To UBound(parts)
+        cleaned = Trim$(parts(i))
+        cleaned = Replace(cleaned, """", "")
+        cleaned = Replace(cleaned, vbLf, "")
+        cleaned = Replace(cleaned, vbCr, "")
+        cleaned = Trim$(cleaned)
+        If cleaned <> "" Then
+            result(j) = cleaned
+            j = j + 1
+        End If
+    Next i
+
+    ReadFixtureList = result
+End Function
+
+Private Function ReadConfigFile() As String
+    ' Try env var path first, then %TEMP% fallback
+    Dim configPath As String
+    configPath = Environ("TEST_HARNESS_CONFIG")
+
+    If configPath = "" Then
+        Dim tempDir As String
+        tempDir = Environ("TEMP")
+        If tempDir = "" Then tempDir = Environ("TMP")
+        If tempDir = "" Then
+            ReadConfigFile = ""
+            Exit Function
+        End If
+        configPath = tempDir & "\_harness_config.json"
+    End If
+
+    On Error Resume Next
+    Dim fNum As Integer
+    fNum = FreeFile
+    Open configPath For Input As #fNum
+    If Err.Number <> 0 Then
+        ReadConfigFile = ""
+        Exit Function
+    End If
+
+    Dim content As String
+    Dim lineText As String
+    Do Until EOF(fNum)
+        Line Input #fNum, lineText
+        content = content & lineText & vbLf
+    Loop
+    Close #fNum
+    On Error GoTo 0
+
+    ReadConfigFile = content
+End Function
+
+'===========================================================================
+' JSON string escaping
+'===========================================================================
+Private Function JsonStr(s As String) As String
+    Dim escaped As String
+    escaped = Replace(s, "\", "\\")
+    escaped = Replace(escaped, """", "\""")
+    escaped = Replace(escaped, vbCr, "\r")
+    escaped = Replace(escaped, vbLf, "\n")
+    escaped = Replace(escaped, vbTab, "\t")
+    JsonStr = """" & escaped & """"
+End Function
+
+==============================================================================
+  FILE 12: harness/Test_Smoke.bas
+==============================================================================
+
+Attribute VB_Name = "Test_Smoke"
+'===========================================================================
+' Test_Smoke — smoke tests for the harness and environment
+'
+' Non-fixture tests: run once, no document argument.
+'===========================================================================
+Option Explicit
+
+Public Sub Test_Smoke_Arithmetic()
+    AssertEqual 4, 2 + 2, "2+2 should equal 4"
+    AssertEqual 6, 2 * 3, "2*3 should equal 6"
+End Sub
+
+Public Sub Test_Smoke_StringOps()
+    AssertEqual "hello world", LCase$("Hello World"), "LCase should work"
+    AssertEqual 5, Len("hello"), "Len should return correct length"
+    AssertContains "hello world", "world", "Should contain 'world'"
+End Sub
+
+Public Sub Test_Smoke_HostDocumentName()
+    Dim docName As String
+    docName = ThisDocument.Name
+    AssertTrue Len(docName) > 0, "Host document name should not be empty"
+End Sub
+
+'===========================================================================
+' Example fixture test (runs once per fixture document)
+'===========================================================================
+Public Sub TestFixture_Smoke_FixtureOpens(doc As Document)
+    ' Verify the fixture document opened successfully and is readable
+    AssertTrue Len(doc.Name) > 0, "Fixture document name should not be empty"
+    AssertTrue doc.Paragraphs.Count >= 1, "Fixture should have at least one paragraph"
+End Sub
+
+==============================================================================
+  FILE 13: README.md
+==============================================================================
+
+# Word VBA Patch Automator
+
+Local automation loop for testing and repairing VBA macro code in Microsoft Word.
+
+Runs inside **Windows** (e.g. Parallels VM). Uses COM automation to drive real Word, a VBA test harness for ground-truth testing, and generates repair prompts for Claude Code CLI.
+
+## Architecture
+
+```
+controller.py (parent)
+  │
+  ├── check locked paths (git status --porcelain)
+  ├── discover fixtures from tests/fixtures/
+  │
+  └── spawn word_runner.py (child subprocess)
+        │
+        ├── open host/MacroHost.docm
+        ├── import VBA source from src/
+        ├── import harness from harness/
+        ├── run TestHarness.RunAllTests
+        │     ├── smoke tests (no fixture)
+        │     ├── logic tests (no fixture)
+        │     └── for each fixture in tests/fixtures/
+        │           ├── open fixture read-only
+        │           ├── run TestFixture_* subs
+        │           ├── record per-fixture results
+        │           └── close fixture
+        └── write JSON results
+
+  controller reads results
+  ├── write report_NNN.json (detailed)
+  ├── write summary_NNN.txt (concise)
+  └── if failed: write repair_prompt_NNN.md
+        └── human runs: claude -p repair_prompt_NNN.md
+
+  if timeout: controller kills child + Word via taskkill
+```
+
+The subprocess boundary is what makes timeout enforcement real. If Word hangs inside a VBA macro, the controller can still kill the child process and Word.
+
+## Folder Structure
+
+```
+word-code-patch-automator/
+├── project.json                # All configuration (single source of truth)
+├── CLAUDE.md                   # Instructions for Claude Code
+├── .gitignore
+│
+├── host/                       # Mutable macro container
+│   └── MacroHost.docm          #   ← you create this
+│
+├── src/                        # VBA source (.bas, .cls, .frm)
+│   └── MyModule.bas
+│
+├── harness/                    # VBA test harness
+│   ├── TestHarness.bas         #   test runner framework
+│   └── Test_Smoke.bas          #   example tests
+│
+├── tests/
+│   ├── fixtures/               # Fixture documents — protected
+│   └── expected/               # Expected outputs — protected
+│
+├── controller/
+│   ├── controller.py           # Parent orchestrator
+│   ├── word_runner.py          # Child COM worker
+│   ├── vba_io.py               # Manual import/export tool
+│   └── templates/
+│       └── repair_prompt.md
+│
+└── results/                    # Generated each run (gitignored)
+```
+
+## Host Document vs Fixture Documents
+
+| | Host (`host/MacroHost.docm`) | Fixtures (`tests/fixtures/`) |
+|--|--|--|
+| Purpose | Mutable container for VBA code | Immutable test inputs |
+| VBA imported? | Yes — source + harness | No |
+| Modified at runtime? | Yes | Opened read-only |
+| Protected from Claude? | No | Yes |
+
+## Configuration (project.json)
+
+Single source of truth for all settings:
+
+```json
+{
+    "project_name": "MyVBAProject",
+    "host_doc": "host/MacroHost.docm",
+    "src_dir": "src",
+    "fixtures_dir": "tests/fixtures",
+    "expected_dir": "tests/expected",
+    "results_dir": "results",
+    "mutable_paths": ["src/", "controller/", "harness/"],
+    "locked_paths": ["tests/fixtures/", "tests/expected/", "project.json", "CLAUDE.md"],
+    "controller": {
+        "max_iterations": 5,
+        "timeout_seconds": 60,
+        "word_visible": false,
+        "kill_on_timeout": true
+    },
+    "harness": {
+        "entry_sub": "RunAllTests"
+    }
+}
+```
+
+`locked_paths` defines what the controller enforces before each run. `mutable_paths` defines what the repair prompt tells Claude it may edit.
+
+## Setup (Windows VM)
+
+1. Python 3.8+ with `pip install pywin32`
+2. Microsoft Word with "Trust access to VBA project object model" enabled
+3. Git
+4. Clone this repo
+5. Create `host/MacroHost.docm` — empty macro-enabled document
+6. Place VBA source in `src/`, fixtures in `tests/fixtures/`, test modules in `harness/`
+7. Run: `python controller\controller.py`
+
+## Usage
+
+```powershell
+# Run tests
+python controller\controller.py
+
+# If tests fail, run Claude against the repair prompt
+claude -p results\repair_prompt_001.md
+
+# Re-run to verify
+python controller\controller.py
+
+# Manual import/export
+python controller\vba_io.py import
+python controller\vba_io.py export
+python controller\vba_io.py import --visible
+python controller\vba_io.py export --doc path\to\other.docm
+```
+
+## Test Layers
+
+| Layer | Naming | Fixture? |
+|-------|--------|----------|
+| Smoke | Built into TestHarness | No |
+| Logic | `Sub Test_Logic_*()` | No |
+| Regression | `Sub TestFixture_Regression_*(doc)` | Yes |
+| Integration | `Sub TestFixture_Integration_*(doc)` | Yes |
+
+Non-fixture tests run once. Fixture tests run once per fixture document.
+
+## Writing Tests
+
+```vba
+Attribute VB_Name = "Test_MyTests"
+Option Explicit
+
+' Non-fixture test — runs once
+Public Sub Test_MyTests_ParseDate()
+    AssertEqual 2026, ParseYear("2026-03-13"), "Should parse year"
+End Sub
+
+' Fixture test — runs once per fixture document
+Public Sub TestFixture_MyTests_CheckParagraph(doc As Document)
+    AssertContains doc.Paragraphs(1).Range.Text, "Expected", "Should contain expected text"
+End Sub
+```
+
+Assertions: `AssertTrue`, `AssertFalse`, `AssertEqual`, `AssertNotEqual`, `AssertContains`, `Fail`.
+
+## Reporting
+
+Each iteration produces:
+
+**`report_NNN.json`** — detailed, fixture-centric:
+```json
+{
+  "project": "MyVBAProject",
+  "iteration": 1,
+  "timestamp": "2026-03-13T14:30:00",
+  "elapsed_seconds": 2.34,
+  "timed_out": false,
+  "word_killed": false,
+  "fixtures": [
+    {"name": "doc1.docm", "status": "pass", "elapsed": 1.2, "errors": []},
+    {"name": "doc2.docm", "status": "fail", "elapsed": 0.8, "errors": ["..."]}
+  ],
+  "tests": [...],
+  "summary": {
+    "fixtures_total": 2, "fixtures_passed": 1, "fixtures_failed": 1,
+    "tests_total": 8, "tests_passed": 6, "tests_failed": 2,
+    "timed_out": 0, "all_passed": false
+  }
+}
+```
+
+**`summary_NNN.txt`** — concise:
+```
+Run summary
+-----------
+iteration: 1
+fixtures:  2
+tests:     8
+passed:    6
+failed:    2
+timeouts:  0
+elapsed:   2.3s
+
+Failed fixtures:
+  - doc2.docm
+
+Failed tests:
+  - Test_Logic.Test_ParseDate — Expected [2026] but got [2025]
+  - Test_Regression.TestFixture_Bug42 [doc2.docm] — Missing paragraph
+
+result: FAIL
+```
+
+Timeout case:
+```
+Run summary
+-----------
+iteration: 2
+fixtures:  0
+tests:     0
+passed:    0
+failed:    0
+timeouts:  1
+elapsed:   60.1s
+word:      killed
+error:     TIMEOUT: test run exceeded 60s limit (Word killed)
+
+result: FAIL
+```
+
+## Locked Path Enforcement
+
+The controller runs `git status --porcelain` before each test pass and checks for changes under `locked_paths` (from `project.json`). It catches:
+- Modified but unstaged files
+- Staged changes
+- Untracked files in protected directories
+
+If violations are found, the run is aborted with a clear message.
+
+## .frm / .frx Limitations
+
+- `.frm` files import/export via COM
+- `.frx` binary companions must travel alongside `.frm` in `src/`
+- UserForm functional testing is not covered in the MVP
+
+## MVP vs Future
+
+**MVP (this version):** Semi-automatic repair flow, real timeout via subprocess, working-tree locked-path enforcement, fixture-based test loop with per-fixture reporting, flat `src/` layout, dual-format reporting.
+
+**Future:** Fully automatic (controller invokes Claude CLI), per-rule timing, expected output diffing, UserForm testing, test tagging, parallel execution.
+
+==============================================================================
+  END OF EXPORT
+==============================================================================

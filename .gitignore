@@ -8,8 +8,7 @@ venv/
 # Results (generated each run)
 results/
 
-# Code export dump
-project_code_export.txt
+# Code export dump is intentionally tracked — updated on every patch
 
 # Word temp files
 ~$*.doc*
