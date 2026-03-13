@@ -2,10 +2,14 @@
 VBA Import / Export utility — standalone script for manual use.
 
 Usage:
-    python vba_io.py import          Import src/ modules into the Word document
-    python vba_io.py export          Export VBA modules from the Word document to src/
+    python vba_io.py import          Import src/ modules into the host document
+    python vba_io.py export          Export VBA modules from the host document to src/
     python vba_io.py export-all      Export all modules including harness/test modules
     python vba_io.py roundtrip       Export then import (useful for normalising)
+
+Options:
+    --visible       Show Word window during operation
+    --doc PATH      Override host document path (relative to project root)
 
 Runs inside Windows with pywin32 installed.
 """
@@ -26,25 +30,21 @@ def load_config():
 
 def get_word_app(visible=False):
     import win32com.client
-    try:
-        word = win32com.client.GetActiveObject("Word.Application")
-    except Exception:
-        word = win32com.client.Dispatch("Word.Application")
+    word = win32com.client.Dispatch("Word.Application")
     word.Visible = visible
     word.DisplayAlerts = 0
     return word
 
 
-def import_modules(word, doc, src_dir):
+def import_modules(doc, src_dir):
     """Import .bas/.cls/.frm files from src_dir, replacing existing modules."""
     vb_project = doc.VBProject
     src_path = Path(src_dir)
-    ext_types = {".bas": 1, ".cls": 2, ".frm": 3}
+    valid_ext = {".bas", ".cls", ".frm"}
     imported = []
 
     for fpath in sorted(src_path.iterdir()):
-        ext = fpath.suffix.lower()
-        if ext not in ext_types:
+        if fpath.is_dir() or fpath.suffix.lower() not in valid_ext:
             continue
 
         mod_name = fpath.stem
@@ -54,7 +54,7 @@ def import_modules(word, doc, src_dir):
             existing = vb_project.VBComponents(mod_name)
             if existing.Type != 100:
                 vb_project.VBComponents.Remove(existing)
-                time.sleep(0.3)  # Brief pause for COM stability
+                time.sleep(0.3)
         except Exception:
             pass
 
@@ -96,20 +96,28 @@ def export_modules(doc, dest_dir, include_tests=False):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python vba_io.py [import|export|export-all|roundtrip]")
+        print("Usage: python vba_io.py [import|export|export-all|roundtrip] [--visible] [--doc PATH]")
         sys.exit(1)
 
     action = sys.argv[1].lower()
     config = load_config()
     visible = "--visible" in sys.argv
 
-    word_doc_path = (PROJECT_ROOT / config["word_doc"]).resolve()
-    src_dir = (PROJECT_ROOT / config["src_dir"]).resolve()
+    # Allow --doc override
+    doc_override = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--doc" and i + 1 < len(sys.argv):
+            doc_override = sys.argv[i + 1]
+
+    doc_rel = doc_override or config["host_doc"]
+    word_doc_path = (PROJECT_ROOT / doc_rel).resolve()
+    src_dir = (PROJECT_ROOT / config.get("src_dir", "src")).resolve()
 
     if not word_doc_path.exists():
         print(f"Error: Document not found: {word_doc_path}")
         sys.exit(1)
 
+    print(f"Document: {word_doc_path}")
     print(f"Opening Word (visible={visible})...")
     word = get_word_app(visible=visible)
 
@@ -118,7 +126,7 @@ def main():
 
         if action == "import":
             print(f"Importing from {src_dir}...")
-            imported = import_modules(word, doc, src_dir)
+            imported = import_modules(doc, src_dir)
             doc.Save()
             print(f"Done. Imported {len(imported)} module(s).")
 
@@ -136,7 +144,7 @@ def main():
             print("Exporting...")
             export_modules(doc, src_dir, include_tests=False)
             print("Re-importing...")
-            import_modules(word, doc, src_dir)
+            import_modules(doc, src_dir)
             doc.Save()
             print("Roundtrip complete.")
 

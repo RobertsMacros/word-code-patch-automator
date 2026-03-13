@@ -4,6 +4,12 @@ Word VBA Patch Automator — Controller (MVP)
 Runs inside Windows (e.g. Parallels VM).
 Orchestrates: import VBA → run test harness → capture results → generate repair prompt.
 
+Architecture:
+  - Controller (this script) is the parent process / orchestrator.
+  - word_runner.py is spawned as a child process for each test run.
+  - The subprocess boundary allows real timeout enforcement:
+    if Word hangs, the controller kills the child process and Word.
+
 Dependencies: pywin32 (pip install pywin32)
 """
 
@@ -12,92 +18,141 @@ import os
 import subprocess
 import sys
 import time
-import shutil
-import signal
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Paths
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
+WORD_RUNNER = SCRIPT_DIR / "word_runner.py"
+
 
 def load_config():
-    cfg_path = PROJECT_ROOT / "project.json"
-    with open(cfg_path, "r", encoding="utf-8") as f:
+    with open(PROJECT_ROOT / "project.json", "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 # ---------------------------------------------------------------------------
 # Locked-path enforcement
 # ---------------------------------------------------------------------------
 
 def load_locked_paths():
-    lp_path = PROJECT_ROOT / "locked_paths.json"
-    with open(lp_path, "r", encoding="utf-8") as f:
+    with open(PROJECT_ROOT / "locked_paths.json", "r", encoding="utf-8") as f:
         data = json.load(f)
     return data.get("locked", [])
 
 
-def check_locked_paths(changed_files, locked_paths):
-    """Return list of violations: changed files that fall under locked paths."""
+def is_under_locked_path(rel_path, locked_paths):
+    """Check if a relative path falls under any locked path."""
+    rel_norm = rel_path.replace("\\", "/")
+    for locked in locked_paths:
+        locked_norm = locked.rstrip("/").replace("\\", "/")
+        # Match exact file or anything under a locked directory
+        if rel_norm == locked_norm or rel_norm.startswith(locked_norm + "/"):
+            return True
+        # Match exact file entries (e.g. "project.json")
+        if "/" not in locked_norm and rel_norm == locked_norm:
+            return True
+    return False
+
+
+def check_locked_paths_working_tree(locked_paths):
+    """
+    Check for locked-path violations in the working tree.
+    Catches: modified (unstaged), staged, and untracked files under locked paths.
+    Returns list of (filepath, status) tuples for violations.
+    """
     violations = []
-    for fpath in changed_files:
-        rel = os.path.relpath(fpath, PROJECT_ROOT).replace("\\", "/")
-        for locked in locked_paths:
-            locked_norm = locked.replace("\\", "/")
-            if rel == locked_norm or rel.startswith(locked_norm):
-                violations.append(rel)
-                break
-    return violations
 
-
-def get_changed_files_since(commit_hash):
-    """Return list of files changed since the given commit (absolute paths)."""
+    # git status --porcelain gives us everything: staged, modified, untracked
     try:
         result = subprocess.run(
-            ["git", "diff", "--name-only", commit_hash, "HEAD"],
+            ["git", "status", "--porcelain"],
             capture_output=True, text=True, cwd=str(PROJECT_ROOT)
         )
         if result.returncode != 0:
-            return []
-        files = [
-            str(PROJECT_ROOT / line.strip())
-            for line in result.stdout.strip().splitlines()
-            if line.strip()
-        ]
-        return files
+            return violations
+
+        for line in result.stdout.splitlines():
+            if len(line) < 4:
+                continue
+
+            status_code = line[:2]
+            file_path = line[3:].strip()
+
+            # Handle renames: "R  old -> new"
+            if " -> " in file_path:
+                file_path = file_path.split(" -> ", 1)[1]
+
+            # Remove quotes if present
+            file_path = file_path.strip('"')
+
+            if is_under_locked_path(file_path, locked_paths):
+                # Decode status
+                if status_code[0] == "?" and status_code[1] == "?":
+                    status = "untracked"
+                elif status_code[0] != " ":
+                    status = "staged"
+                else:
+                    status = "modified"
+                violations.append((file_path, status))
+
     except Exception:
+        pass
+
+    return violations
+
+
+def check_locked_paths():
+    """
+    Full locked-path check. Returns True if clean, False if violations found.
+    Prints violations to stdout.
+    """
+    locked_paths = load_locked_paths()
+    violations = check_locked_paths_working_tree(locked_paths)
+
+    if violations:
+        print("LOCKED PATH VIOLATION — the following locked files have changes:")
+        for fpath, status in violations:
+            print(f"  [{status:>9s}] {fpath}")
+        print()
+        print("Revert these changes before running the controller.")
+        print("Aborting.")
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Fixture discovery
+# ---------------------------------------------------------------------------
+
+def discover_fixtures(fixtures_dir):
+    """
+    Find all fixture documents in the fixtures directory.
+    Returns list of absolute paths, sorted by name.
+    Supports .docm, .docx, .doc files.
+    """
+    fixture_path = Path(fixtures_dir)
+    if not fixture_path.exists():
         return []
 
+    valid_ext = {".docm", ".docx", ".doc"}
+    fixtures = []
+    for fpath in sorted(fixture_path.iterdir()):
+        if fpath.suffix.lower() in valid_ext and not fpath.name.startswith("~$"):
+            fixtures.append(str(fpath.resolve()))
 
-def get_current_commit():
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, cwd=str(PROJECT_ROOT)
-        )
-        return result.stdout.strip() if result.returncode == 0 else None
-    except Exception:
-        return None
+    return fixtures
 
 
 # ---------------------------------------------------------------------------
-# Word COM automation
+# Kill Word
 # ---------------------------------------------------------------------------
-
-def get_word_app(visible=False):
-    """Launch or connect to Word via COM."""
-    import win32com.client
-    try:
-        word = win32com.client.GetActiveObject("Word.Application")
-    except Exception:
-        word = win32com.client.Dispatch("Word.Application")
-    word.Visible = visible
-    word.DisplayAlerts = 0  # wdAlertsNone
-    return word
-
 
 def kill_word():
     """Force-kill all Word processes."""
@@ -108,203 +163,191 @@ def kill_word():
     time.sleep(2)
 
 
-def import_vba_modules(word, doc, src_dir):
-    """
-    Import all .bas / .cls / .frm files from src_dir into the document's
-    VBA project, replacing existing modules of the same name.
-    """
-    vb_project = doc.VBProject
-    src_path = Path(src_dir)
-
-    # Map of extension → VBA component type constants
-    # 1=vbext_ct_StdModule, 2=vbext_ct_ClassModule, 3=vbext_ct_MSForm
-    ext_types = {".bas": 1, ".cls": 2, ".frm": 3}
-
-    imported = []
-    for fpath in sorted(src_path.iterdir()):
-        ext = fpath.suffix.lower()
-        if ext not in ext_types:
-            continue
-
-        mod_name = fpath.stem
-
-        # Remove existing module if present (skip built-in document modules)
-        try:
-            existing = vb_project.VBComponents(mod_name)
-            comp_type = existing.Type
-            # 100 = vbext_ct_Document — cannot remove these
-            if comp_type != 100:
-                vb_project.VBComponents.Remove(existing)
-        except Exception:
-            pass
-
-        # Import
-        vb_project.VBComponents.Import(str(fpath.resolve()))
-        imported.append(fpath.name)
-
-    return imported
-
-
-def import_harness_modules(word, doc, harness_dir):
-    """Import test harness modules from the harness/ directory."""
-    return import_vba_modules(word, doc, harness_dir)
-
-
-def export_vba_modules(doc, dest_dir):
-    """
-    Export all VBA components from the document to dest_dir.
-    Skips document modules (ThisDocument, Sheet objects).
-    """
-    dest = Path(dest_dir)
-    dest.mkdir(parents=True, exist_ok=True)
-
-    ext_map = {1: ".bas", 2: ".cls", 3: ".frm"}
-    exported = []
-
-    for comp in doc.VBProject.VBComponents:
-        comp_type = comp.Type
-        if comp_type == 100:  # Document module
-            continue
-        ext = ext_map.get(comp_type)
-        if ext is None:
-            continue
-
-        out_path = dest / (comp.Name + ext)
-        comp.Export(str(out_path.resolve()))
-        exported.append(out_path.name)
-
-    return exported
-
-
 # ---------------------------------------------------------------------------
-# Test execution
+# Test execution (subprocess with real timeout)
 # ---------------------------------------------------------------------------
 
-def run_test_harness(word, doc, result_file, entry_sub, timeout):
+def run_test_pass(config, iteration, results_dir):
     """
-    Run the VBA test harness entry point.
-    Sets an environment variable with the result file path so VBA can write to it.
-    Returns (success, elapsed_seconds, error_message).
+    Run one full test pass by spawning word_runner.py as a subprocess.
+    The controller enforces a real timeout — if the subprocess hangs,
+    it kills the process and Word.
+
+    Returns (all_passed: bool, report: dict).
     """
-    # Write result path to a known location the VBA harness can read.
-    # VBA will use Environ() or read from a temp file.
-    result_path = Path(result_file).resolve()
-    config_path = result_path.parent / "_harness_config.json"
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump({"result_file": str(result_path)}, f)
+    timeout = config["controller"].get("timeout_seconds", 60)
+    visible = config["controller"].get("word_visible", False)
+    entry_sub = config["harness"].get("entry_sub", "RunAllTests")
+    kill_on_timeout = config["controller"].get("kill_on_timeout", True)
 
-    # Also set environment variable for VBA Environ() access
-    os.environ["TEST_RESULT_PATH"] = str(result_path)
+    host_doc_path = str((PROJECT_ROOT / config["host_doc"]).resolve())
+    src_dir = str((PROJECT_ROOT / config.get("src_dir", "src")).resolve())
+    harness_dir = str((PROJECT_ROOT / "harness").resolve())
+    fixtures_dir = str((PROJECT_ROOT / config.get("fixtures_dir", "tests/fixtures")).resolve())
 
-    # Delete old result file if exists
-    if result_path.exists():
-        result_path.unlink()
+    result_file = str(results_dir / f"harness_output_{iteration:03d}.json")
+    runner_output = str(results_dir / f"runner_output_{iteration:03d}.json")
 
+    # Discover fixture documents
+    fixtures = discover_fixtures(fixtures_dir)
+
+    # Build the run config for word_runner.py
+    run_config = {
+        "host_doc_path": host_doc_path,
+        "src_dir": src_dir,
+        "harness_dir": harness_dir,
+        "entry_sub": entry_sub,
+        "word_visible": visible,
+        "result_file": result_file,
+        "runner_output_file": runner_output,
+        "fixtures": fixtures
+    }
+
+    # Write run config to a temp file
+    run_config_path = str(results_dir / f"_run_config_{iteration:03d}.json")
+    with open(run_config_path, "w", encoding="utf-8") as f:
+        json.dump(run_config, f, indent=2)
+
+    # Spawn the worker subprocess
     start = time.time()
+    word_killed = False
+    timed_out = False
     error_msg = None
-    success = False
+    runner_result = None
 
     try:
-        # Run the VBA macro
-        word.Run(entry_sub)
+        proc = subprocess.Popen(
+            [sys.executable, str(WORD_RUNNER), run_config_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
 
-        elapsed = time.time() - start
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.kill()
+            proc.wait(timeout=5)
 
-        # Check if result file was written
-        if result_path.exists():
-            success = True
-        else:
-            error_msg = "Harness did not produce a result file"
+            if kill_on_timeout:
+                kill_word()
+                word_killed = True
+
+            error_msg = f"TIMEOUT: test run exceeded {timeout}s limit"
+            if word_killed:
+                error_msg += " (Word killed)"
 
     except Exception as e:
-        elapsed = time.time() - start
-        error_msg = f"COM error running harness: {e}"
+        error_msg = f"Failed to spawn word_runner: {e}"
 
-    # Enforce timeout
-    if elapsed > timeout:
-        error_msg = f"Timeout: harness took {elapsed:.1f}s (limit {timeout}s)"
-        success = False
+    elapsed = time.time() - start
 
-    return success, elapsed, error_msg
+    # Read runner output if it exists
+    if os.path.exists(runner_output):
+        try:
+            with open(runner_output, "r", encoding="utf-8") as f:
+                runner_result = json.load(f)
+        except Exception as e:
+            error_msg = error_msg or f"Failed to read runner output: {e}"
 
+    # Build the report
+    if runner_result and runner_result.get("error"):
+        error_msg = error_msg or runner_result["error"]
 
-# ---------------------------------------------------------------------------
-# Result parsing and reporting
-# ---------------------------------------------------------------------------
+    tests = []
+    fixture_results = []
+    if runner_result:
+        tests = runner_result.get("tests", [])
+        fixture_results = runner_result.get("fixtures", [])
 
-def parse_results(result_file):
-    """Parse the JSON result file written by the VBA harness."""
-    try:
-        with open(result_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        return {"error": f"Failed to parse results: {e}", "tests": []}
-
-
-def generate_summary(results, elapsed, iteration, error_msg=None):
-    """Generate a concise human-readable summary string."""
-    lines = []
-    lines.append(f"=== Test Run Summary (iteration {iteration}) ===")
-    lines.append(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"Elapsed: {elapsed:.2f}s")
-
-    if error_msg:
-        lines.append(f"ERROR: {error_msg}")
-
-    tests = results.get("tests", [])
     passed = sum(1 for t in tests if t.get("passed"))
     failed = sum(1 for t in tests if not t.get("passed"))
     total = len(tests)
-
-    lines.append(f"Tests: {total} total, {passed} passed, {failed} failed")
-
-    if failed > 0:
-        lines.append("")
-        lines.append("Failed tests:")
-        for t in tests:
-            if not t.get("passed"):
-                name = t.get("name", "?")
-                msg = t.get("message", "")
-                dur = t.get("duration_ms", "?")
-                lines.append(f"  FAIL: {name} ({dur}ms) — {msg}")
-
-    # Timeout/crash info
-    timed_out = [t for t in tests if t.get("timed_out")]
-    if timed_out:
-        lines.append("")
-        lines.append("Timed-out tests:")
-        for t in timed_out:
-            lines.append(f"  TIMEOUT: {t.get('name', '?')}")
-
-    lines.append("")
-    all_pass = failed == 0 and total > 0 and error_msg is None
-    lines.append(f"Result: {'PASS' if all_pass else 'FAIL'}")
-    lines.append("=" * 44)
-
-    return "\n".join(lines)
-
-
-def generate_detailed_report(results, elapsed, iteration, error_msg=None):
-    """Generate the full detailed JSON report for machine consumption."""
-    tests = results.get("tests", [])
-    passed = sum(1 for t in tests if t.get("passed"))
-    failed = sum(1 for t in tests if not t.get("passed"))
+    all_passed = (failed == 0 and total > 0 and error_msg is None
+                  and not timed_out)
 
     report = {
         "iteration": iteration,
         "timestamp": datetime.now().isoformat(),
         "elapsed_seconds": round(elapsed, 3),
         "error": error_msg,
+        "timed_out": timed_out,
+        "word_killed": word_killed,
+        "fixtures_tested": [os.path.basename(f) for f in fixtures],
+        "fixture_results": fixture_results,
         "summary": {
-            "total": len(tests),
+            "total": total,
             "passed": passed,
             "failed": failed,
-            "all_passed": failed == 0 and len(tests) > 0 and error_msg is None
+            "all_passed": all_passed
         },
         "tests": tests,
-        "raw_harness_output": results
+        "raw_runner_output": runner_result
     }
-    return report
+
+    return all_passed, report
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+def generate_summary(report):
+    """Generate a concise human-readable summary string."""
+    lines = []
+    iteration = report["iteration"]
+    elapsed = report["elapsed_seconds"]
+
+    lines.append(f"=== Test Run Summary (iteration {iteration}) ===")
+    lines.append(f"Time:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Elapsed: {elapsed:.2f}s")
+
+    if report.get("timed_out"):
+        lines.append(f"TIMEOUT: run exceeded limit")
+    if report.get("word_killed"):
+        lines.append(f"Word was force-killed")
+    if report.get("error"):
+        lines.append(f"ERROR: {report['error']}")
+
+    # Fixture info
+    fixtures = report.get("fixtures_tested", [])
+    if fixtures:
+        lines.append(f"Fixtures: {', '.join(fixtures)}")
+
+    s = report["summary"]
+    lines.append(f"Tests: {s['total']} total, {s['passed']} passed, {s['failed']} failed")
+
+    # Failed tests
+    failed_tests = [t for t in report.get("tests", []) if not t.get("passed")]
+    if failed_tests:
+        lines.append("")
+        lines.append("Failed tests:")
+        for t in failed_tests:
+            name = t.get("name", "?")
+            msg = t.get("message", "")
+            dur = t.get("duration_ms", "?")
+            fixture = t.get("fixture", "")
+            prefix = f"  FAIL: {name}"
+            if fixture:
+                prefix += f" [{fixture}]"
+            prefix += f" ({dur}ms)"
+            if msg:
+                prefix += f" — {msg}"
+            lines.append(prefix)
+
+    # Timed-out individual tests (VBA-level)
+    timed_out_tests = [t for t in report.get("tests", []) if t.get("timed_out")]
+    if timed_out_tests:
+        lines.append("")
+        lines.append("Timed-out tests:")
+        for t in timed_out_tests:
+            lines.append(f"  TIMEOUT: {t.get('name', '?')}")
+
+    lines.append("")
+    lines.append(f"Result: {'PASS' if s['all_passed'] else 'FAIL'}")
+    lines.append("=" * 48)
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +355,7 @@ def generate_detailed_report(results, elapsed, iteration, error_msg=None):
 # ---------------------------------------------------------------------------
 
 def generate_repair_prompt(report, config, iteration):
-    """Generate a repair prompt file that can be fed to Claude Code CLI."""
+    """Generate a repair prompt file for Claude Code CLI."""
     template_path = PROJECT_ROOT / "controller" / "templates" / "repair_prompt.md"
     if template_path.exists():
         with open(template_path, "r", encoding="utf-8") as f:
@@ -320,7 +363,6 @@ def generate_repair_prompt(report, config, iteration):
     else:
         template = DEFAULT_REPAIR_TEMPLATE
 
-    # Gather failed tests
     failed_tests = [t for t in report.get("tests", []) if not t.get("passed")]
     failed_detail = json.dumps(failed_tests, indent=2)
 
@@ -337,6 +379,8 @@ def generate_repair_prompt(report, config, iteration):
         src_dir=src_dir,
         mutable_paths="\n".join(f"  - {p}" for p in mutable),
         elapsed=report["elapsed_seconds"],
+        timed_out="Yes" if report.get("timed_out") else "No",
+        word_killed="Yes" if report.get("word_killed") else "No",
         full_report_json=json.dumps(report, indent=2)
     )
 
@@ -348,15 +392,18 @@ DEFAULT_REPAIR_TEMPLATE = """# VBA Repair Prompt — Iteration {iteration}/{max_
 ## Status
 - **{failed_count}** of **{total_count}** tests failed
 - Elapsed: {elapsed}s
+- Timed out: {timed_out}
+- Word killed: {word_killed}
 - Error: {error_message}
 
 ## Rules
-1. You may ONLY modify files under: {src_dir}/
+1. You may ONLY modify files under: `{src_dir}/`
 2. Allowed mutable paths:
 {mutable_paths}
 3. Do NOT modify any test files, fixtures, expected outputs, harness code, or controller code.
 4. Do NOT add new files outside the mutable paths.
 5. Focus on fixing the failing tests below.
+6. Make minimal, targeted fixes — do not refactor unrelated code.
 
 ## Failed Tests
 ```json
@@ -369,11 +416,12 @@ DEFAULT_REPAIR_TEMPLATE = """# VBA Repair Prompt — Iteration {iteration}/{max_
 ```
 
 ## Instructions
-- Read the failing test details above.
-- Identify the root cause in the VBA source files under `{src_dir}/`.
-- Make minimal, targeted fixes.
-- Do not refactor or change code unrelated to the failures.
-- After making changes, save all modified files.
+1. Read the failing test details above carefully.
+2. Read the relevant VBA source files under `{src_dir}/`.
+3. Identify the root cause of each failure.
+4. Make minimal, targeted fixes in the source files.
+5. Do not change any files outside `{src_dir}/`.
+6. Save all modified files when done.
 """
 
 
@@ -381,109 +429,47 @@ DEFAULT_REPAIR_TEMPLATE = """# VBA Repair Prompt — Iteration {iteration}/{max_
 # Main controller loop
 # ---------------------------------------------------------------------------
 
-def run_iteration(config, iteration, results_dir):
-    """Run one import → test → report cycle. Returns (all_passed, report)."""
-    word = None
-    doc = None
-    result_file = results_dir / f"results_{iteration:03d}.json"
-
-    try:
-        visible = config["controller"].get("word_visible", False)
-        timeout = config["controller"].get("timeout_seconds", 60)
-        entry_sub = config["harness"].get("entry_sub", "RunAllTests")
-
-        word_doc_path = (PROJECT_ROOT / config["word_doc"]).resolve()
-        src_dir = (PROJECT_ROOT / config["src_dir"]).resolve()
-        harness_dir = (PROJECT_ROOT / "harness").resolve()
-
-        if not word_doc_path.exists():
-            return False, {
-                "error": f"Word document not found: {word_doc_path}",
-                "summary": {"total": 0, "passed": 0, "failed": 0, "all_passed": False},
-                "tests": [],
-                "iteration": iteration,
-                "timestamp": datetime.now().isoformat(),
-                "elapsed_seconds": 0
-            }
-
-        print(f"  Starting Word (visible={visible})...")
-        word = get_word_app(visible=visible)
-
-        print(f"  Opening {word_doc_path.name}...")
-        doc = word.Documents.Open(str(word_doc_path))
-
-        print(f"  Importing VBA source from {src_dir}...")
-        imported_src = import_vba_modules(word, doc, src_dir)
-        print(f"    Imported: {', '.join(imported_src) if imported_src else '(none)'}")
-
-        print(f"  Importing test harness from {harness_dir}...")
-        imported_harness = import_harness_modules(word, doc, harness_dir)
-        print(f"    Imported: {', '.join(imported_harness) if imported_harness else '(none)'}")
-
-        print(f"  Running test harness ({entry_sub})...")
-        success, elapsed, error_msg = run_test_harness(
-            word, doc, str(result_file), entry_sub, timeout
-        )
-
-        # Parse results
-        if result_file.exists():
-            results = parse_results(str(result_file))
-        else:
-            results = {"tests": []}
-
-        report = generate_detailed_report(results, elapsed, iteration, error_msg)
-        all_passed = report["summary"]["all_passed"]
-
-        return all_passed, report
-
-    except Exception as e:
-        return False, {
-            "error": str(e),
-            "summary": {"total": 0, "passed": 0, "failed": 0, "all_passed": False},
-            "tests": [],
-            "iteration": iteration,
-            "timestamp": datetime.now().isoformat(),
-            "elapsed_seconds": 0
-        }
-
-    finally:
-        # Clean up Word
-        try:
-            if doc:
-                doc.Close(0)  # wdDoNotSaveChanges
-        except Exception:
-            pass
-        try:
-            if word:
-                word.Quit()
-        except Exception:
-            pass
-
-
 def main():
     config = load_config()
     max_iters = config["controller"]["max_iterations"]
+    timeout = config["controller"]["timeout_seconds"]
     results_dir = PROJECT_ROOT / config.get("results_dir", "results")
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    locked_paths = load_locked_paths()
+    # Verify host document exists
+    host_doc = PROJECT_ROOT / config["host_doc"]
+    if not host_doc.exists():
+        print(f"Error: Host document not found: {host_doc}")
+        print(f"Create a macro-enabled document at: {host_doc}")
+        sys.exit(1)
+
+    # Verify fixtures directory
+    fixtures_dir = PROJECT_ROOT / config.get("fixtures_dir", "tests/fixtures")
+    fixtures = discover_fixtures(str(fixtures_dir))
 
     print("=" * 60)
     print("Word VBA Patch Automator — Controller (MVP)")
-    print(f"Project: {config['project_name']}")
-    print(f"Max iterations: {max_iters}")
-    print(f"Timeout: {config['controller']['timeout_seconds']}s")
+    print(f"Project:    {config['project_name']}")
+    print(f"Host doc:   {host_doc}")
+    print(f"Fixtures:   {len(fixtures)} found in {fixtures_dir}")
+    print(f"Timeout:    {timeout}s")
+    print(f"Max iters:  {max_iters}")
     print("=" * 60)
+
+    if not fixtures:
+        print(f"\nWarning: No fixture documents found in {fixtures_dir}")
+        print("Tests that require fixtures will be skipped.")
+
+    # Check locked paths BEFORE running
+    if not check_locked_paths():
+        sys.exit(1)
 
     run_reports = []
 
     for iteration in range(1, max_iters + 1):
         print(f"\n--- Iteration {iteration}/{max_iters} ---")
 
-        # Record commit before this iteration for lock checking
-        pre_commit = get_current_commit()
-
-        all_passed, report = run_iteration(config, iteration, results_dir)
+        all_passed, report = run_test_pass(config, iteration, results_dir)
         run_reports.append(report)
 
         # Write detailed JSON report
@@ -491,17 +477,11 @@ def main():
         with open(report_file, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
 
-        # Write human summary
-        summary = generate_summary(
-            report.get("raw_harness_output", report),
-            report["elapsed_seconds"],
-            iteration,
-            report.get("error")
-        )
+        # Write + print human summary
+        summary = generate_summary(report)
         summary_file = results_dir / f"summary_{iteration:03d}.txt"
         with open(summary_file, "w", encoding="utf-8") as f:
             f.write(summary)
-
         print(summary)
 
         if all_passed:
@@ -514,15 +494,9 @@ def main():
             prompt_file = results_dir / f"repair_prompt_{iteration:03d}.md"
             with open(prompt_file, "w", encoding="utf-8") as f:
                 f.write(prompt)
-            print(f"\nRepair prompt written to: {prompt_file}")
-            print(">>> Run Claude Code CLI against this prompt, then re-run the controller. <<<")
-
-            # In semi-automatic mode, stop here and wait for human
-            print("\n[Semi-automatic mode] Waiting for you to run Claude and re-invoke.")
+            print(f"\nRepair prompt: {prompt_file}")
+            print("[Semi-automatic] Run Claude Code CLI, then re-run the controller:")
             print(f"  claude -p {prompt_file}")
-
-            # After Claude runs (next iteration), check locked paths
-            # For MVP semi-auto, we check on next invocation start
             break
         else:
             print(f"\nMax iterations ({max_iters}) reached. Tests still failing.")
@@ -536,47 +510,8 @@ def main():
             "iterations": run_reports
         }, f, indent=2)
 
-    print(f"\nFull run log: {combined_file}")
-
-
-def check_locks_before_run():
-    """Check if any locked files were modified since last run. Call at start."""
-    config = load_config()
-    locked_paths = load_locked_paths()
-
-    # Read last known commit from a marker file
-    marker = PROJECT_ROOT / "results" / ".last_commit"
-    if not marker.exists():
-        # First run — record current commit
-        commit = get_current_commit()
-        if commit:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            with open(marker, "w") as f:
-                f.write(commit)
-        return True
-
-    with open(marker, "r") as f:
-        last_commit = f.read().strip()
-
-    changed = get_changed_files_since(last_commit)
-    violations = check_locked_paths(changed, locked_paths)
-
-    if violations:
-        print("LOCKED PATH VIOLATION — the following locked files were modified:")
-        for v in violations:
-            print(f"  - {v}")
-        print("\nReverting is recommended. Aborting.")
-        return False
-
-    # Update marker
-    commit = get_current_commit()
-    if commit:
-        with open(marker, "w") as f:
-            f.write(commit)
-    return True
+    print(f"\nRun log: {combined_file}")
 
 
 if __name__ == "__main__":
-    if not check_locks_before_run():
-        sys.exit(1)
     main()
