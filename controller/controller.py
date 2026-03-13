@@ -168,7 +168,7 @@ def run_test_pass(config, iteration, results_dir):
 
     host_doc_path = str((PROJECT_ROOT / config["host_doc"]).resolve())
     src_dir = str((PROJECT_ROOT / config.get("src_dir", "src")).resolve())
-    harness_dir = str((PROJECT_ROOT / "harness").resolve())
+    harness_dir = str((PROJECT_ROOT / config.get("harness_dir", "harness")).resolve())
     fixtures_dir = str((PROJECT_ROOT / config.get("fixtures_dir", "tests/fixtures")).resolve())
 
     result_file = str(results_dir / f"harness_output_{iteration:03d}.json")
@@ -373,6 +373,7 @@ def generate_summary(report):
 
     lines.append("")
     lines.append(f"result: {'PASS' if s['all_passed'] else 'FAIL'}")
+    lines.append(f"report: results/report_{report['iteration']:03d}.json")
 
     return "\n".join(lines)
 
