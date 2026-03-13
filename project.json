@@ -3,6 +3,7 @@
 
     "host_doc": "host/MacroHost.docm",
     "src_dir": "src",
+    "harness_dir": "harness",
     "fixtures_dir": "tests/fixtures",
     "expected_dir": "tests/expected",
     "results_dir": "results",
