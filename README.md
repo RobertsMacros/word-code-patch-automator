@@ -1,154 +1,87 @@
 # Word VBA Patch Automator
 
-A local-first automation loop for testing and repairing VBA macro code in Microsoft Word.
+Local automation loop for testing and repairing VBA macro code in Microsoft Word.
 
-Runs inside **Windows** (e.g. Parallels VM on Mac). Uses COM automation to drive real Word, a VBA test harness for ground-truth testing, and generates repair prompts for Claude Code CLI.
+Runs inside **Windows** (e.g. Parallels VM). Uses COM automation to drive real Word, a VBA test harness for ground-truth testing, and generates repair prompts for Claude Code CLI.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Controller (Python) — parent process                            │
-│                                                                  │
-│  1. Check locked paths (working tree + staged)                   │
-│  2. Discover fixture documents from tests/fixtures/              │
-│  3. Spawn word_runner.py as a child process                      │
-│  4. Monitor with real timeout — kill Word if it hangs            │
-│  5. Read JSON results from the harness                           │
-│  6. Generate detailed report + concise summary                   │
-│  7. If tests fail: generate repair_prompt.md                     │
-│  8. Human runs Claude Code CLI against the prompt                │
-│  9. Claude patches only src/ files                               │
-│ 10. Re-run controller (back to step 1)                           │
-│ 11. Stop on: all pass OR max iterations reached                  │
-│                                                                  │
-│  word_runner.py — child process (subprocess boundary)            │
-│  ├── Opens host/MacroHost.docm                                   │
-│  ├── Imports VBA source (src/) + harness modules                 │
-│  ├── Runs TestHarness.RunAllTests via COM                        │
-│  └── If Word hangs, controller kills this process + Word         │
-└──────────────────────────────────────────────────────────────────┘
+controller.py (parent)
+  │
+  ├── check locked paths (git status --porcelain)
+  ├── discover fixtures from tests/fixtures/
+  │
+  └── spawn word_runner.py (child subprocess)
+        │
+        ├── open host/MacroHost.docm
+        ├── import VBA source from src/
+        ├── import harness from harness/
+        ├── run TestHarness.RunAllTests
+        │     ├── smoke tests (no fixture)
+        │     ├── logic tests (no fixture)
+        │     └── for each fixture in tests/fixtures/
+        │           ├── open fixture read-only
+        │           ├── run TestFixture_* subs
+        │           ├── record per-fixture results
+        │           └── close fixture
+        └── write JSON results
 
-Key points:
-- Subprocess boundary enables real timeout enforcement
-- host/MacroHost.docm = mutable macro container (NOT a test fixture)
-- tests/fixtures/*.docm = immutable test documents
-- Controller decides when to stop, not Claude
-- Claude may only modify files under src/
+  controller reads results
+  ├── write report_NNN.json (detailed)
+  ├── write summary_NNN.txt (concise)
+  └── if failed: write repair_prompt_NNN.md
+        └── human runs: claude -p repair_prompt_NNN.md
+
+  if timeout: controller kills child + Word via taskkill
 ```
+
+The subprocess boundary is what makes timeout enforcement real. If Word hangs inside a VBA macro, the controller can still kill the child process and Word.
 
 ## Folder Structure
 
 ```
 word-code-patch-automator/
-├── CLAUDE.md                   # Instructions for Claude (immutable paths, rules)
-├── project.json                # Project config
-├── locked_paths.json           # Paths Claude must not modify
+├── project.json                # All configuration (single source of truth)
+├── CLAUDE.md                   # Instructions for Claude Code
 ├── .gitignore
 │
 ├── host/                       # Mutable macro container
-│   └── MacroHost.docm          #   ← create this yourself
+│   └── MacroHost.docm          #   ← you create this
 │
-├── src/                        # VBA source files (.bas, .cls, .frm)
-│   └── MyModule.bas            #   ← your VBA modules go here
+├── src/                        # VBA source (.bas, .cls, .frm)
+│   └── MyModule.bas
 │
-├── harness/                    # VBA test harness (imported into host doc)
-│   ├── TestHarness.bas         #   ← test runner framework
-│   └── Test_Smoke.bas          #   ← smoke tests
+├── harness/                    # VBA test harness
+│   ├── TestHarness.bas         #   test runner framework
+│   └── Test_Smoke.bas          #   example tests
 │
 ├── tests/
-│   ├── fixtures/               # Fixture documents (.docm) — immutable
-│   │   └── SampleDoc.docm
-│   └── expected/               # Expected outputs for regression tests
+│   ├── fixtures/               # Fixture documents — protected
+│   └── expected/               # Expected outputs — protected
 │
 ├── controller/
-│   ├── controller.py           # Main controller (parent orchestrator)
-│   ├── word_runner.py          # COM worker (child process)
-│   ├── vba_io.py               # Standalone import/export tool
+│   ├── controller.py           # Parent orchestrator
+│   ├── word_runner.py          # Child COM worker
+│   ├── vba_io.py               # Manual import/export tool
 │   └── templates/
-│       └── repair_prompt.md    # Repair prompt template
+│       └── repair_prompt.md
 │
 └── results/                    # Generated each run (gitignored)
-    ├── report_001.json         #   detailed machine-readable report
-    ├── summary_001.txt         #   concise human-readable summary
-    ├── repair_prompt_001.md    #   repair prompt for Claude
-    └── run_log.json            #   combined iteration log
 ```
 
-### Host Document vs Fixture Documents
+## Host Document vs Fixture Documents
 
 | | Host (`host/MacroHost.docm`) | Fixtures (`tests/fixtures/`) |
 |--|--|--|
-| **Purpose** | Mutable container for VBA code | Immutable test documents |
-| **VBA imported?** | Yes — source + harness | No |
-| **Modified at runtime?** | Yes | Opened read-only |
-| **Claude may edit?** | No (locked) | No (locked) |
-| **You create it** | Once, manually | Per test scenario |
-
-## Test Layers
-
-| Layer | Naming Pattern | Fixture Needed? | Speed |
-|-------|---------------|-----------------|-------|
-| **Smoke** | Built into harness | No | <1s |
-| **Fast logic** | `Sub Test_Logic_*()` | No | Fast |
-| **Regression** | `Sub TestFixture_Regression_*(doc)` | Yes | Medium |
-| **Integration** | `Sub TestFixture_Integration_*(doc)` | Yes | Slower |
-
-- **Non-fixture tests** (`Test_*`): Run once, no document argument
-- **Fixture tests** (`TestFixture_*`): Run once per fixture document, receive `Document` parameter
-
-## Setup (Windows VM)
-
-### Prerequisites
-- Python 3.8+
-- `pip install pywin32`
-- Microsoft Word
-- Trust access to VBA project object model enabled in Word
-  (File > Options > Trust Center > Trust Center Settings > Macro Settings)
-- Git
-
-### Quick Start
-
-1. Clone this repo inside the Windows VM
-2. Create `host/MacroHost.docm` — an empty macro-enabled document
-3. Place your VBA source files (`.bas`, `.cls`) in `src/`
-4. Place fixture documents in `tests/fixtures/`
-5. Add test modules (`Test_*.bas`) to `harness/`
-6. Run:
-
-```powershell
-python controller\controller.py
-```
-
-7. If tests fail, the controller generates a repair prompt:
-
-```powershell
-claude -p results\repair_prompt_001.md
-```
-
-8. Re-run the controller to verify:
-
-```powershell
-python controller\controller.py
-```
-
-## Import / Export
-
-```powershell
-# Import src/ modules into host document
-python controller\vba_io.py import
-
-# Export from host document to src/
-python controller\vba_io.py export
-
-# With Word visible
-python controller\vba_io.py import --visible
-
-# Use a different document
-python controller\vba_io.py export --doc path/to/other.docm
-```
+| Purpose | Mutable container for VBA code | Immutable test inputs |
+| VBA imported? | Yes — source + harness | No |
+| Modified at runtime? | Yes | Opened read-only |
+| Protected from Claude? | No | Yes |
 
 ## Configuration (project.json)
+
+Single source of truth for all settings:
 
 ```json
 {
@@ -158,7 +91,8 @@ python controller\vba_io.py export --doc path/to/other.docm
     "fixtures_dir": "tests/fixtures",
     "expected_dir": "tests/expected",
     "results_dir": "results",
-    "mutable_paths": ["src/"],
+    "mutable_paths": ["src/", "controller/", "harness/"],
+    "locked_paths": ["tests/fixtures/", "tests/expected/", "project.json", "CLAUDE.md"],
     "controller": {
         "max_iterations": 5,
         "timeout_seconds": 60,
@@ -171,136 +105,149 @@ python controller\vba_io.py export --doc path/to/other.docm
 }
 ```
 
-## Timeout Enforcement
+`locked_paths` defines what the controller enforces before each run. `mutable_paths` defines what the repair prompt tells Claude it may edit.
 
-The controller uses a **subprocess boundary** for real timeout enforcement:
+## Setup (Windows VM)
 
-1. `controller.py` spawns `word_runner.py` as a child process
-2. `word_runner.py` does all COM work (open Word, import VBA, run harness)
-3. Controller monitors with `subprocess.communicate(timeout=N)`
-4. If timeout expires: kills the child process, then `taskkill /F /IM WINWORD.EXE`
-5. Reports the timeout clearly in both JSON and summary output
+1. Python 3.8+ with `pip install pywin32`
+2. Microsoft Word with "Trust access to VBA project object model" enabled
+3. Git
+4. Clone this repo
+5. Create `host/MacroHost.docm` — empty macro-enabled document
+6. Place VBA source in `src/`, fixtures in `tests/fixtures/`, test modules in `harness/`
+7. Run: `python controller\controller.py`
 
-This works even if Word is completely hung inside a VBA macro.
+## Usage
 
-## Reporting
+```powershell
+# Run tests
+python controller\controller.py
 
-Each iteration produces two files:
+# If tests fail, run Claude against the repair prompt
+claude -p results\repair_prompt_001.md
 
-**`report_NNN.json`** — detailed machine-readable report:
-- Per-test name, pass/fail, message, duration, fixture
-- Per-fixture pass/fail counts and timing
-- Timeout and Word-killed flags
-- Full harness output
+# Re-run to verify
+python controller\controller.py
 
-**`summary_NNN.txt`** — concise human-readable:
-```
-=== Test Run Summary (iteration 1) ===
-Time:    2026-03-13 14:30:00
-Elapsed: 2.34s
-Fixtures: TestDoc1.docm, TestDoc2.docm
-Tests: 8 total, 6 passed, 2 failed
-
-Failed tests:
-  FAIL: Test_Logic.Test_ParseDate (12.3ms) — Expected [2026] but got [2025]
-  FAIL: Test_Regression.TestFixture_Bug42 [TestDoc1.docm] (45.1ms) — Missing paragraph
-
-Result: FAIL
-================================================
+# Manual import/export
+python controller\vba_io.py import
+python controller\vba_io.py export
+python controller\vba_io.py import --visible
+python controller\vba_io.py export --doc path\to\other.docm
 ```
 
-Timeout/crash cases are reported clearly:
-```
-=== Test Run Summary (iteration 2) ===
-Time:    2026-03-13 14:32:00
-Elapsed: 60.12s
-TIMEOUT: run exceeded limit
-Word was force-killed
-ERROR: TIMEOUT: test run exceeded 60s limit (Word killed)
-Tests: 0 total, 0 passed, 0 failed
+## Test Layers
 
-Result: FAIL
-================================================
-```
+| Layer | Naming | Fixture? |
+|-------|--------|----------|
+| Smoke | Built into TestHarness | No |
+| Logic | `Sub Test_Logic_*()` | No |
+| Regression | `Sub TestFixture_Regression_*(doc)` | Yes |
+| Integration | `Sub TestFixture_Integration_*(doc)` | Yes |
 
-## Locked Path Enforcement
-
-Three layers:
-
-1. **CLAUDE.md** — Claude Code reads this and is instructed not to touch locked paths
-2. **locked_paths.json** — Machine-readable list
-3. **Controller check** — runs `git status --porcelain` before each run to catch:
-   - Modified but unstaged files in locked paths
-   - Staged changes to locked files
-   - Untracked files in locked directories
-
-If violations are found, the controller prints them and aborts.
+Non-fixture tests run once. Fixture tests run once per fixture document.
 
 ## Writing Tests
 
-### Non-fixture tests (logic, smoke)
-
 ```vba
-Attribute VB_Name = "Test_Logic"
+Attribute VB_Name = "Test_MyTests"
 Option Explicit
 
-Public Sub Test_Logic_ParseDate()
+' Non-fixture test — runs once
+Public Sub Test_MyTests_ParseDate()
     AssertEqual 2026, ParseYear("2026-03-13"), "Should parse year"
 End Sub
 
-Public Sub Test_Logic_ValidateInput()
-    AssertTrue IsValidInput("hello"), "Should accept valid input"
-    AssertFalse IsValidInput(""), "Should reject empty input"
-End Sub
-```
-
-### Fixture-based tests (regression, integration)
-
-```vba
-Attribute VB_Name = "Test_Regression"
-Option Explicit
-
-Public Sub TestFixture_Regression_Bug42(doc As Document)
-    ' doc is a fixture document opened read-only by the harness
-    Dim para As Paragraph
-    Set para = doc.Paragraphs(1)
-    AssertContains para.Range.Text, "Expected text", "First paragraph should contain expected text"
-End Sub
-
-Public Sub TestFixture_Integration_FormatCheck(doc As Document)
-    ' Run the macro against the fixture
-    doc.Range.Select
-    Application.Run "MyFormatter"
-    AssertEqual "Formatted", doc.Paragraphs(1).Style.NameLocal, "Should apply Formatted style"
+' Fixture test — runs once per fixture document
+Public Sub TestFixture_MyTests_CheckParagraph(doc As Document)
+    AssertContains doc.Paragraphs(1).Range.Text, "Expected", "Should contain expected text"
 End Sub
 ```
 
 Assertions: `AssertTrue`, `AssertFalse`, `AssertEqual`, `AssertNotEqual`, `AssertContains`, `Fail`.
 
+## Reporting
+
+Each iteration produces:
+
+**`report_NNN.json`** — detailed, fixture-centric:
+```json
+{
+  "project": "MyVBAProject",
+  "iteration": 1,
+  "timestamp": "2026-03-13T14:30:00",
+  "elapsed_seconds": 2.34,
+  "timed_out": false,
+  "word_killed": false,
+  "fixtures": [
+    {"name": "doc1.docm", "status": "pass", "elapsed": 1.2, "errors": []},
+    {"name": "doc2.docm", "status": "fail", "elapsed": 0.8, "errors": ["..."]}
+  ],
+  "tests": [...],
+  "summary": {
+    "fixtures_total": 2, "fixtures_passed": 1, "fixtures_failed": 1,
+    "tests_total": 8, "tests_passed": 6, "tests_failed": 2,
+    "timed_out": 0, "all_passed": false
+  }
+}
+```
+
+**`summary_NNN.txt`** — concise:
+```
+Run summary
+-----------
+iteration: 1
+fixtures:  2
+tests:     8
+passed:    6
+failed:    2
+timeouts:  0
+elapsed:   2.3s
+
+Failed fixtures:
+  - doc2.docm
+
+Failed tests:
+  - Test_Logic.Test_ParseDate — Expected [2026] but got [2025]
+  - Test_Regression.TestFixture_Bug42 [doc2.docm] — Missing paragraph
+
+result: FAIL
+```
+
+Timeout case:
+```
+Run summary
+-----------
+iteration: 2
+fixtures:  0
+tests:     0
+passed:    0
+failed:    0
+timeouts:  1
+elapsed:   60.1s
+word:      killed
+error:     TIMEOUT: test run exceeded 60s limit (Word killed)
+
+result: FAIL
+```
+
+## Locked Path Enforcement
+
+The controller runs `git status --porcelain` before each test pass and checks for changes under `locked_paths` (from `project.json`). It catches:
+- Modified but unstaged files
+- Staged changes
+- Untracked files in protected directories
+
+If violations are found, the run is aborted with a clear message.
+
 ## .frm / .frx Limitations
 
-- `.frm` (UserForm) files can be imported/exported via COM
-- `.frx` (binary companion files for forms with images/controls) must travel alongside the `.frm`
-- UserForm testing beyond import/export is not covered in the MVP
-- If a form has embedded images or ActiveX controls, the `.frx` must be present in `src/` next to the `.frm`
+- `.frm` files import/export via COM
+- `.frx` binary companions must travel alongside `.frm` in `src/`
+- UserForm functional testing is not covered in the MVP
 
 ## MVP vs Future
 
-### MVP (this version)
-- Semi-automatic: controller generates repair prompt, human runs Claude
-- Real timeout enforcement via subprocess boundary
-- Working-tree locked-path checking (modified, staged, untracked)
-- Host document / fixture document separation
-- Fixture-based test loop with per-fixture reporting
-- Flat `src/` directory (all .bas/.cls/.frm in one folder)
-- JSON + text dual-format reporting
-- Timeout/crash/killed-Word clearly reported
+**MVP (this version):** Semi-automatic repair flow, real timeout via subprocess, working-tree locked-path enforcement, fixture-based test loop with per-fixture reporting, flat `src/` layout, dual-format reporting.
 
-### Future Upgrades
-- Fully automatic mode (controller invokes Claude CLI directly)
-- Per-rule timing for document checker macros
-- Expected output comparison for regression tests
-- UserForm functional testing
-- Test tagging and selective runs
-- Parallel test execution
-- CI integration (optional)
+**Future:** Fully automatic (controller invokes Claude CLI), per-rule timing, expected output diffing, UserForm testing, test tagging, parallel execution.

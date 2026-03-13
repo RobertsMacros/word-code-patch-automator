@@ -8,14 +8,15 @@
     "results_dir": "results",
 
     "mutable_paths": [
-        "src/"
-    ],
-    "immutable_paths": [
-        "tests/",
-        "harness/",
+        "src/",
         "controller/",
+        "harness/"
+    ],
+    "locked_paths": [
+        "tests/fixtures/",
+        "tests/expected/",
         "project.json",
-        "locked_paths.json"
+        "CLAUDE.md"
     ],
 
     "controller": {
