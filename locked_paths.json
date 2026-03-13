@@ -1,11 +1,10 @@
 {
-    "_comment": "Files and directories that Claude must not modify. The controller checks this after each repair cycle.",
+    "_comment": "Files and directories that Claude must not modify. The controller checks this before each run.",
     "locked": [
         "tests/",
-        "tests/fixtures/",
-        "tests/expected/",
         "harness/",
         "controller/",
+        "host/",
         "project.json",
         "locked_paths.json"
     ]

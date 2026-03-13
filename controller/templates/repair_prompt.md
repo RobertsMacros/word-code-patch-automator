@@ -3,6 +3,8 @@
 ## Status
 - **{failed_count}** of **{total_count}** tests failed
 - Elapsed: {elapsed}s
+- Timed out: {timed_out}
+- Word killed: {word_killed}
 - Error: {error_message}
 
 ## Rules
