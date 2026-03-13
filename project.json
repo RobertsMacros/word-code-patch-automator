@@ -1,0 +1,36 @@
+{
+    "project_name": "MyVBAProject",
+    "word_doc": "tests/fixtures/TestDocument.docm",
+    "template_doc": null,
+
+    "src_dir": "src",
+    "tests_dir": "tests",
+    "fixtures_dir": "tests/fixtures",
+    "expected_dir": "tests/expected",
+    "results_dir": "results",
+
+    "mutable_paths": [
+        "src/"
+    ],
+    "immutable_paths": [
+        "tests/",
+        "harness/",
+        "controller/",
+        "project.json",
+        "locked_paths.json"
+    ],
+
+    "controller": {
+        "max_iterations": 5,
+        "timeout_seconds": 60,
+        "word_visible": false,
+        "kill_on_timeout": true,
+        "retry_on_crash": true
+    },
+
+    "harness": {
+        "test_module": "TestHarness",
+        "entry_sub": "RunAllTests",
+        "result_file_env_var": "TEST_RESULT_PATH"
+    }
+}
