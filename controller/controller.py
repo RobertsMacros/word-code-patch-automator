@@ -18,7 +18,6 @@ import os
 import subprocess
 import sys
 import time
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -40,22 +39,12 @@ def load_config():
 # Locked-path enforcement
 # ---------------------------------------------------------------------------
 
-def load_locked_paths():
-    with open(PROJECT_ROOT / "locked_paths.json", "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data.get("locked", [])
-
-
 def is_under_locked_path(rel_path, locked_paths):
     """Check if a relative path falls under any locked path."""
     rel_norm = rel_path.replace("\\", "/")
     for locked in locked_paths:
         locked_norm = locked.rstrip("/").replace("\\", "/")
-        # Match exact file or anything under a locked directory
         if rel_norm == locked_norm or rel_norm.startswith(locked_norm + "/"):
-            return True
-        # Match exact file entries (e.g. "project.json")
-        if "/" not in locked_norm and rel_norm == locked_norm:
             return True
     return False
 
@@ -67,8 +56,6 @@ def check_locked_paths_working_tree(locked_paths):
     Returns list of (filepath, status) tuples for violations.
     """
     violations = []
-
-    # git status --porcelain gives us everything: staged, modified, untracked
     try:
         result = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -88,11 +75,9 @@ def check_locked_paths_working_tree(locked_paths):
             if " -> " in file_path:
                 file_path = file_path.split(" -> ", 1)[1]
 
-            # Remove quotes if present
             file_path = file_path.strip('"')
 
             if is_under_locked_path(file_path, locked_paths):
-                # Decode status
                 if status_code[0] == "?" and status_code[1] == "?":
                     status = "untracked"
                 elif status_code[0] != " ":
@@ -107,16 +92,18 @@ def check_locked_paths_working_tree(locked_paths):
     return violations
 
 
-def check_locked_paths():
+def check_locked_paths(config):
     """
     Full locked-path check. Returns True if clean, False if violations found.
-    Prints violations to stdout.
     """
-    locked_paths = load_locked_paths()
+    locked_paths = config.get("locked_paths", [])
+    if not locked_paths:
+        return True
+
     violations = check_locked_paths_working_tree(locked_paths)
 
     if violations:
-        print("LOCKED PATH VIOLATION — the following locked files have changes:")
+        print("LOCKED PATH VIOLATION — the following protected files have changes:")
         for fpath, status in violations:
             print(f"  [{status:>9s}] {fpath}")
         print()
@@ -135,7 +122,6 @@ def discover_fixtures(fixtures_dir):
     """
     Find all fixture documents in the fixtures directory.
     Returns list of absolute paths, sorted by name.
-    Supports .docm, .docx, .doc files.
     """
     fixture_path = Path(fixtures_dir)
     if not fixture_path.exists():
@@ -203,7 +189,6 @@ def run_test_pass(config, iteration, results_dir):
         "fixtures": fixtures
     }
 
-    # Write run config to a temp file
     run_config_path = str(results_dir / f"_run_config_{iteration:03d}.json")
     with open(run_config_path, "w", encoding="utf-8") as f:
         json.dump(run_config, f, indent=2)
@@ -250,42 +235,90 @@ def run_test_pass(config, iteration, results_dir):
         except Exception as e:
             error_msg = error_msg or f"Failed to read runner output: {e}"
 
-    # Build the report
     if runner_result and runner_result.get("error"):
         error_msg = error_msg or runner_result["error"]
 
-    tests = []
+    # Build fixture-centric report
+    report = build_report(
+        config, iteration, elapsed, fixtures,
+        runner_result, error_msg, timed_out, word_killed
+    )
+
+    return report["summary"]["all_passed"], report
+
+
+def build_report(config, iteration, elapsed, fixture_paths,
+                 runner_result, error_msg, timed_out, word_killed):
+    """
+    Build the canonical report structure.
+    Fixture-centric: each fixture gets a top-level entry with
+    name, status, elapsed, and errors.
+    """
     fixture_results = []
+    tests = []
+
     if runner_result:
         tests = runner_result.get("tests", [])
-        fixture_results = runner_result.get("fixtures", [])
+        raw_fixtures = runner_result.get("fixtures", [])
 
-    passed = sum(1 for t in tests if t.get("passed"))
-    failed = sum(1 for t in tests if not t.get("passed"))
-    total = len(tests)
-    all_passed = (failed == 0 and total > 0 and error_msg is None
-                  and not timed_out)
+        # Reshape raw fixture results into the canonical format
+        for rf in raw_fixtures:
+            name = rf.get("fixture", rf.get("name", "unknown"))
+            failed = rf.get("failed", 0)
+            fx_elapsed = rf.get("elapsed_seconds", 0)
+            fx_error = rf.get("error", "")
 
-    report = {
+            # Collect error messages for this fixture from the test list
+            errors = []
+            if fx_error:
+                errors.append(fx_error)
+            for t in tests:
+                if t.get("fixture") == name and not t.get("passed"):
+                    errors.append(f"{t.get('name', '?')}: {t.get('message', '')}")
+
+            fixture_results.append({
+                "name": name,
+                "status": "fail" if (failed > 0 or fx_error) else "pass",
+                "elapsed": fx_elapsed,
+                "passed": rf.get("passed", 0),
+                "failed": failed,
+                "errors": errors if errors else []
+            })
+
+    # Summarise fixtures
+    fx_total = len(fixture_results)
+    fx_passed = sum(1 for f in fixture_results if f["status"] == "pass")
+    fx_failed = sum(1 for f in fixture_results if f["status"] == "fail")
+
+    # Summarise all tests (including non-fixture smoke/logic tests)
+    test_total = len(tests)
+    test_passed = sum(1 for t in tests if t.get("passed"))
+    test_failed = sum(1 for t in tests if not t.get("passed"))
+
+    all_passed = (test_failed == 0 and test_total > 0
+                  and error_msg is None and not timed_out)
+
+    return {
+        "project": config["project_name"],
         "iteration": iteration,
         "timestamp": datetime.now().isoformat(),
         "elapsed_seconds": round(elapsed, 3),
         "error": error_msg,
         "timed_out": timed_out,
         "word_killed": word_killed,
-        "fixtures_tested": [os.path.basename(f) for f in fixtures],
-        "fixture_results": fixture_results,
-        "summary": {
-            "total": total,
-            "passed": passed,
-            "failed": failed,
-            "all_passed": all_passed
-        },
+        "fixtures": fixture_results,
         "tests": tests,
-        "raw_runner_output": runner_result
+        "summary": {
+            "fixtures_total": fx_total,
+            "fixtures_passed": fx_passed,
+            "fixtures_failed": fx_failed,
+            "tests_total": test_total,
+            "tests_passed": test_passed,
+            "tests_failed": test_failed,
+            "timed_out": 1 if timed_out else 0,
+            "all_passed": all_passed
+        }
     }
-
-    return all_passed, report
 
 
 # ---------------------------------------------------------------------------
@@ -293,31 +326,36 @@ def run_test_pass(config, iteration, results_dir):
 # ---------------------------------------------------------------------------
 
 def generate_summary(report):
-    """Generate a concise human-readable summary string."""
+    """Generate a concise human-readable summary."""
     lines = []
-    iteration = report["iteration"]
+    s = report["summary"]
     elapsed = report["elapsed_seconds"]
 
-    lines.append(f"=== Test Run Summary (iteration {iteration}) ===")
-    lines.append(f"Time:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"Elapsed: {elapsed:.2f}s")
+    lines.append("Run summary")
+    lines.append("-----------")
+    lines.append(f"iteration: {report['iteration']}")
+    lines.append(f"fixtures:  {s['fixtures_total']}")
+    lines.append(f"tests:     {s['tests_total']}")
+    lines.append(f"passed:    {s['tests_passed']}")
+    lines.append(f"failed:    {s['tests_failed']}")
+    lines.append(f"timeouts:  {s['timed_out']}")
+    lines.append(f"elapsed:   {elapsed:.1f}s")
 
-    if report.get("timed_out"):
-        lines.append(f"TIMEOUT: run exceeded limit")
     if report.get("word_killed"):
-        lines.append(f"Word was force-killed")
+        lines.append("word:      killed")
+
     if report.get("error"):
-        lines.append(f"ERROR: {report['error']}")
+        lines.append(f"error:     {report['error']}")
 
-    # Fixture info
-    fixtures = report.get("fixtures_tested", [])
-    if fixtures:
-        lines.append(f"Fixtures: {', '.join(fixtures)}")
+    # Failed fixtures
+    failed_fixtures = [f for f in report.get("fixtures", []) if f["status"] == "fail"]
+    if failed_fixtures:
+        lines.append("")
+        lines.append("Failed fixtures:")
+        for f in failed_fixtures:
+            lines.append(f"  - {f['name']}")
 
-    s = report["summary"]
-    lines.append(f"Tests: {s['total']} total, {s['passed']} passed, {s['failed']} failed")
-
-    # Failed tests
+    # Failed tests (including non-fixture)
     failed_tests = [t for t in report.get("tests", []) if not t.get("passed")]
     if failed_tests:
         lines.append("")
@@ -325,27 +363,16 @@ def generate_summary(report):
         for t in failed_tests:
             name = t.get("name", "?")
             msg = t.get("message", "")
-            dur = t.get("duration_ms", "?")
             fixture = t.get("fixture", "")
-            prefix = f"  FAIL: {name}"
+            line = f"  - {name}"
             if fixture:
-                prefix += f" [{fixture}]"
-            prefix += f" ({dur}ms)"
+                line += f" [{fixture}]"
             if msg:
-                prefix += f" — {msg}"
-            lines.append(prefix)
-
-    # Timed-out individual tests (VBA-level)
-    timed_out_tests = [t for t in report.get("tests", []) if t.get("timed_out")]
-    if timed_out_tests:
-        lines.append("")
-        lines.append("Timed-out tests:")
-        for t in timed_out_tests:
-            lines.append(f"  TIMEOUT: {t.get('name', '?')}")
+                line += f" — {msg}"
+            lines.append(line)
 
     lines.append("")
-    lines.append(f"Result: {'PASS' if s['all_passed'] else 'FAIL'}")
-    lines.append("=" * 48)
+    lines.append(f"result: {'PASS' if s['all_passed'] else 'FAIL'}")
 
     return "\n".join(lines)
 
@@ -364,20 +391,19 @@ def generate_repair_prompt(report, config, iteration):
         template = DEFAULT_REPAIR_TEMPLATE
 
     failed_tests = [t for t in report.get("tests", []) if not t.get("passed")]
-    failed_detail = json.dumps(failed_tests, indent=2)
 
-    src_dir = config.get("src_dir", "src")
     mutable = config.get("mutable_paths", ["src/"])
+    locked = config.get("locked_paths", [])
 
     prompt = template.format(
         iteration=iteration,
         max_iterations=config["controller"]["max_iterations"],
         failed_count=len(failed_tests),
-        total_count=report["summary"]["total"],
-        failed_tests_json=failed_detail,
+        total_count=report["summary"]["tests_total"],
+        failed_tests_json=json.dumps(failed_tests, indent=2),
         error_message=report.get("error") or "None",
-        src_dir=src_dir,
-        mutable_paths="\n".join(f"  - {p}" for p in mutable),
+        mutable_paths="\n".join(f"  - `{p}`" for p in mutable),
+        locked_paths="\n".join(f"  - `{p}`" for p in locked),
         elapsed=report["elapsed_seconds"],
         timed_out="Yes" if report.get("timed_out") else "No",
         word_killed="Yes" if report.get("word_killed") else "No",
@@ -397,13 +423,13 @@ DEFAULT_REPAIR_TEMPLATE = """# VBA Repair Prompt — Iteration {iteration}/{max_
 - Error: {error_message}
 
 ## Rules
-1. You may ONLY modify files under: `{src_dir}/`
-2. Allowed mutable paths:
+You may modify files under these paths:
 {mutable_paths}
-3. Do NOT modify any test files, fixtures, expected outputs, harness code, or controller code.
-4. Do NOT add new files outside the mutable paths.
-5. Focus on fixing the failing tests below.
-6. Make minimal, targeted fixes — do not refactor unrelated code.
+
+You must NOT modify these protected paths:
+{locked_paths}
+
+Make minimal, targeted fixes. Do not refactor unrelated code.
 
 ## Failed Tests
 ```json
@@ -417,11 +443,10 @@ DEFAULT_REPAIR_TEMPLATE = """# VBA Repair Prompt — Iteration {iteration}/{max_
 
 ## Instructions
 1. Read the failing test details above carefully.
-2. Read the relevant VBA source files under `{src_dir}/`.
+2. Read the relevant source files.
 3. Identify the root cause of each failure.
-4. Make minimal, targeted fixes in the source files.
-5. Do not change any files outside `{src_dir}/`.
-6. Save all modified files when done.
+4. Make minimal, targeted fixes.
+5. Save all modified files when done.
 """
 
 
@@ -447,21 +472,21 @@ def main():
     fixtures_dir = PROJECT_ROOT / config.get("fixtures_dir", "tests/fixtures")
     fixtures = discover_fixtures(str(fixtures_dir))
 
-    print("=" * 60)
-    print("Word VBA Patch Automator — Controller (MVP)")
-    print(f"Project:    {config['project_name']}")
-    print(f"Host doc:   {host_doc}")
-    print(f"Fixtures:   {len(fixtures)} found in {fixtures_dir}")
-    print(f"Timeout:    {timeout}s")
-    print(f"Max iters:  {max_iters}")
-    print("=" * 60)
+    print("=" * 50)
+    print("Word VBA Patch Automator")
+    print(f"Project:   {config['project_name']}")
+    print(f"Host doc:  {host_doc}")
+    print(f"Fixtures:  {len(fixtures)} in {fixtures_dir}")
+    print(f"Timeout:   {timeout}s")
+    print(f"Max iters: {max_iters}")
+    print("=" * 50)
 
     if not fixtures:
         print(f"\nWarning: No fixture documents found in {fixtures_dir}")
-        print("Tests that require fixtures will be skipped.")
+        print("Fixture-based tests will be skipped.")
 
     # Check locked paths BEFORE running
-    if not check_locked_paths():
+    if not check_locked_paths(config):
         sys.exit(1)
 
     run_reports = []
@@ -489,7 +514,6 @@ def main():
             break
 
         if iteration < max_iters:
-            # Generate repair prompt
             prompt = generate_repair_prompt(report, config, iteration)
             prompt_file = results_dir / f"repair_prompt_{iteration:03d}.md"
             with open(prompt_file, "w", encoding="utf-8") as f:
