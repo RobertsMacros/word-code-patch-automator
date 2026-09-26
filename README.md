@@ -1,5 +1,7 @@
 # Word VBA Patch Automator
 
+**Roberts Macros: no macro too micro.**
+
 Local automation loop for testing and repairing VBA macro code in Microsoft Word.
 
 Runs inside **Windows** (e.g. Parallels VM). Uses COM automation to drive real Word, a VBA test harness for ground-truth testing, and generates repair prompts for Claude Code CLI.
