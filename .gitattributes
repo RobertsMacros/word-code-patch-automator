@@ -1,0 +1,19 @@
+# Ensure consistent line endings
+* text=auto eol=lf
+
+# Python source
+*.py text eol=lf
+
+# VBA source
+*.bas text eol=lf
+*.cls text eol=lf
+*.frm text eol=lf
+
+# JSON / config
+*.json text eol=lf
+
+# Markdown / docs
+*.md text eol=lf
+
+# Binary companions for UserForms — do not touch
+*.frx binary
