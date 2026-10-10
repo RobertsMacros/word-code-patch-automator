@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 HUB = 'RobertsMacros/project-coordination'
-VERSION = '2026-10-10.1'
+VERSION = '2026-10-10.2'
 CATEGORIES = {'account_access', 'decision', 'approval', 'files', 'api_token', 'physical'}
 
 class ReportingError(RuntimeError):
