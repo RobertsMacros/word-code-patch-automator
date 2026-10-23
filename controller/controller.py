@@ -537,6 +537,23 @@ def main():
 
     print(f"\nRun log: {combined_file}")
 
+    # Regenerate the whole-project code export
+    refresh_code_export()
+
+
+def refresh_code_export():
+    """Regenerate project_code_export.txt so it stays current with every patch."""
+    export_script = PROJECT_ROOT / "export_all_code.py"
+    if export_script.exists():
+        try:
+            subprocess.run(
+                [sys.executable, str(export_script)],
+                cwd=str(PROJECT_ROOT),
+                capture_output=True, timeout=10
+            )
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     main()
